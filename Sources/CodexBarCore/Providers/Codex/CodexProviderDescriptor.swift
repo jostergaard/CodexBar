@@ -385,8 +385,58 @@ struct CodexOAuthFetchStrategy: ProviderFetchStrategy {
     }
 
     func fetch(_ context: ProviderFetchContext) async throws -> ProviderFetchResult {
+        if let workspace = context.codexWorkspaceID,
+           let home = CodexManagedWorkspaceRefresh.home(env: context.env)
+        {
+            return try await Self.fetchManagedWorkspace(
+                context,
+                home: home,
+                workspace: workspace,
+                recovery: .shared,
+                renew: {
+                    var env = context.env
+                    env["CODEX_HOME"] = home.path
+                    try await UsageFetcher(environment: env).refreshCodexCredentials()
+                })
+        }
         let credentials = try await Self.loadCredentials(context, retryStale: true)
         return try await Self.fetch(context: context, credentials: credentials)
+    }
+
+    static func fetchManagedWorkspace(
+        _ context: ProviderFetchContext,
+        home: URL,
+        workspace: String,
+        recovery: CodexManagedWorkspaceRefresh,
+        renew: @escaping @Sendable () async throws -> Void) async throws -> ProviderFetchResult
+    {
+        let snapshot = try CodexManagedWorkspaceRefresh.Snapshot.read(env: context.env)
+        try await recovery.checkTerminalFailure(home: home, workspace: workspace, fingerprint: snapshot.fingerprint)
+        do {
+            let result = try await Self.fetch(context: context, credentials: snapshot.credentials)
+            await recovery.reset(home: home, workspace: workspace, fingerprint: snapshot.fingerprint, env: context.env)
+            return result
+        } catch {
+            let needsRefresh = if case .nativeRefreshRequired = error as? CodexOAuthCredentialsError {
+                true
+            } else if case .unauthorized = error as? CodexOAuthFetchError {
+                true
+            } else {
+                false
+            }
+            guard needsRefresh, snapshot.credentials.source == .codexHome, !snapshot.credentials.isAPIKey else {
+                throw error
+            }
+            return try await recovery.recover(
+                home: home,
+                workspace: workspace,
+                failed: snapshot,
+                env: context.env,
+                renew: renew,
+                retry: { credentials in
+                    try await Self.fetch(context: context, credentials: credentials, afterNativeRenewal: true)
+                })
+        }
     }
 
     private static func loadCredentials(
@@ -416,9 +466,12 @@ struct CodexOAuthFetchStrategy: ProviderFetchStrategy {
 
     private static func fetch(
         context: ProviderFetchContext,
-        credentials initialCredentials: CodexOAuthCredentials) async throws -> ProviderFetchResult
+        credentials initialCredentials: CodexOAuthCredentials,
+        afterNativeRenewal: Bool = false) async throws -> ProviderFetchResult
     {
-        var credentials = try Self.prepareCredentialsForUsage(initialCredentials)
+        // After the CLI has published a changed credential, the scoped API is authoritative, not the age hint.
+        var credentials = try afterNativeRenewal ? initialCredentials : Self
+            .prepareCredentialsForUsage(initialCredentials)
         if let managedWorkspaceAccountID = context.settings?.codex?.managedWorkspaceAccountID,
            !managedWorkspaceAccountID.isEmpty
         {

@@ -318,8 +318,24 @@ implementation instead of copying an OAuth-only fetch example:
    external sources, managed workspace scope, transient API errors, decode failures, and network
    failures remain visible instead of launching an unrelated or unscoped CLI recovery.
 
-HTTP 401 remains an authentication failure. HTTP 403 retains its status as a terminal API permission failure for
-OAuth and PAT requests, including reset-credit and spend-control endpoints; it does not trigger automatic CLI recovery.
+Managed workspace accounts with an explicit `CODEX_HOME` have a separate credential-only recovery path in
+both Auto and OAuth modes. A stale native credential or usage HTTP 401 (including an unexpired JWT invalidated
+by a workspace seat change) invokes Codex app-server `account/read` with `{"refreshToken":true}` in that same
+home, then retries scoped OAuth exactly once. CLI rate-limit/default-workspace usage is never substituted.
+
+Recovery coalesces calls per canonical home, holds `<home>/.codexbar-refresh.lock`, and rereads the credential
+fingerprint before launching. A concurrent publication skips renewal. At most two CLI renewals run across homes.
+The CLI owns all credential writes; CodexBar never redeems tokens or restores older credentials. The persisted
+`tokens.account_id` must match the selected workspace before retry. Auth fingerprints, attempt counts, next
+eligible times and sanitized error classes (no tokens) live in `Application Support/CodexBar/CodexCredentialRefresh`.
+Exponential backoff starts at 30 seconds and caps at one hour; changed credentials or successful usage reset it.
+
+Allowlisted revoked/invalid refresh errors stop immediately for that account. Ownership mismatch or HTTP 401
+after changed credentials also requires login. Some CLI versions hide renewal failures behind successful RPC:
+unchanged credentials are tested against scoped usage, and three consecutive unchanged-plus-401 attempts,
+spaced by backoff, stop with `renewalUnconfirmed`. Network, timeout, 429, 5xx, decode, unknown RPC rejections and
+403 remain transient, retain any CLI-persisted rotation and do not mark login required. Unscoped OAuth keeps
+its existing fallback policy; HTTP 403 never triggers credential recovery.
 
 The key invariant is that the credential snapshot used for the usage request is also passed to
 reset-credit enrichment; reloading `auth.json` after a refresh would reintroduce the shared-file

@@ -13,7 +13,7 @@ struct CodexOAuthManagedWorkspaceRecoveryTests {
     }
 
     @Test
-    func `native refresh recovery is unavailable when managed workspace scope is selected`() async throws {
+    func `unscoped native CLI usage fallback is unavailable when managed workspace scope is selected`() async throws {
         let home = CodexCredentialFixtures.root
             .appendingPathComponent("codexbar-native-refresh-managed-workspace-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)

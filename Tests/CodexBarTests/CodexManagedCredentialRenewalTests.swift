@@ -1,0 +1,652 @@
+import Foundation
+import Testing
+@testable import CodexBarCore
+
+@Suite(CodexCredentialFixtures())
+struct CodexManagedCredentialRenewalTests {
+    @Test(arguments: [ProviderSourceMode.auto, .oauth], [true, false])
+    func `managed OAuth renews expired credentials or an unexpired token rejected with 401`(
+        mode: ProviderSourceMode,
+        expired: Bool) async throws
+    {
+        let fixture = try Fixture(expired: expired)
+        let calls = Calls()
+        let transport = ProviderHTTPTransportStub { request in
+            #expect(request.value(forHTTPHeaderField: "ChatGPT-Account-Id") == Fixture.workspace)
+            if request.value(forHTTPHeaderField: "Authorization") == "Bearer \(fixture.originalToken)" {
+                #expect(!expired)
+                return try Self.response(request, code: 401)
+            }
+            #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer \(Fixture.token("rotated"))")
+            return try Self.response(request)
+        }
+        let context = Self.context(mode: mode, fixture: fixture)
+        let recovery = fixture.coordinator()
+        let pipeline = ProviderFetchPipeline { context in
+            let strategies = await CodexProviderDescriptor.descriptor.fetchPlan.pipeline.resolveStrategies(context)
+            return strategies.map { strategy -> any ProviderFetchStrategy in
+                if strategy.id == "codex.oauth" {
+                    return ManagedStrategy(fixture: fixture, recovery: recovery, renew: {
+                        await calls.renewed()
+                        try fixture.rotate()
+                    })
+                }
+                return UnavailableStrategy(id: strategy.id, kind: strategy.kind)
+            }
+        }
+        let outcome = await CodexAuthenticatedHTTPTransport.$overrideForTesting.withValue(transport) {
+            await pipeline.fetch(context: context, provider: .codex)
+        }
+        let result = try outcome.result.get()
+        #expect(result.sourceLabel == "oauth")
+        #expect(result.usage.primary?.usedPercent == 22)
+        #expect(outcome.attempts.filter(\.wasAvailable).map(\.strategyID) == ["codex.oauth"])
+        #expect(await calls.renewals == 1)
+        #expect(await transport.requests().count == (expired ? 1 : 2))
+        #expect(try fixture.snapshot().credentials.accessToken == Fixture.token("rotated"))
+    }
+
+    @Test
+    func `renewal rejects a credential belonging to another workspace before usage retry`() async throws {
+        let fixture = try Fixture()
+        let calls = Calls()
+        let failed = try fixture.snapshot()
+        await Self.expectUnauthorized {
+            try await fixture.coordinator().recover(
+                home: fixture.home,
+                workspace: Fixture.workspace,
+                failed: failed,
+                env: fixture.env,
+                renew: {
+                    await calls.renewed()
+                    try fixture.rotate(owner: "other-workspace")
+                }, retry: { _ in
+                    await calls.retried()
+                    return Self.result()
+                })
+        }
+        #expect(await calls.renewals == 1)
+        #expect(await calls.retries == 0)
+        #expect(try fixture.snapshot().owner == "other-workspace")
+    }
+
+    @Test
+    func `a changed credential on disk skips renewal and retries the replacement`() async throws {
+        let fixture = try Fixture()
+        let failed = try fixture.snapshot()
+        try fixture.rotate()
+        let calls = Calls()
+        _ = try await fixture.coordinator().recover(
+            home: fixture.home,
+            workspace: Fixture.workspace,
+            failed: failed,
+            env: fixture.env,
+            renew: { await calls.renewed() },
+            retry: { credentials in
+                await calls.retried()
+                #expect(credentials.accessToken == Fixture.token("rotated"))
+                return Self.result()
+            })
+        #expect(await calls.renewals == 0)
+        #expect(await calls.retries == 1)
+    }
+
+    @Test(arguments: [false, true])
+    func `concurrent recovery callers perform only one renewal`(separateCoordinators: Bool) async throws {
+        let fixture = try Fixture()
+        let failed = try fixture.snapshot()
+        let shared = fixture.coordinator()
+        let calls = Calls()
+        let results = try await withThrowingTaskGroup(of: String.self) { group in
+            for _ in 0..<8 {
+                group.addTask {
+                    let recovery = separateCoordinators ? fixture.coordinator() : shared
+                    let result = try await recovery.recover(
+                        home: fixture.home,
+                        workspace: Fixture.workspace,
+                        failed: failed,
+                        env: fixture.env,
+                        renew: {
+                            await calls.renewed()
+                            try await Task.sleep(for: .milliseconds(25))
+                            try fixture.rotate()
+                        }, retry: { credentials in
+                            #expect(credentials.accessToken == Fixture.token("rotated"))
+                            return Self.result()
+                        })
+                    return result.sourceLabel
+                }
+            }
+            var results: [String] = []
+            for try await result in group {
+                results.append(result)
+            }
+            return results
+        }
+        #expect(results == Array(repeating: "oauth", count: 8))
+        #expect(await calls.renewals == 1)
+    }
+
+    @Test
+    func `unchanged renewal retries scoped usage and stops after three unconfirmed 401 failures`() async throws {
+        let fixture = try Fixture()
+        let failed = try fixture.snapshot()
+        let calls = Calls()
+        let now = Date()
+        for (index, elapsed) in [0.0, 31.0, 92.0, 7200.0].enumerated() {
+            let operation = {
+                try await fixture.coordinator().recover(
+                    home: fixture.home,
+                    workspace: Fixture.workspace,
+                    failed: failed,
+                    env: fixture.env,
+                    now: now.addingTimeInterval(elapsed),
+                    renew: { await calls.renewed() },
+                    retry: { _ in
+                        await calls.retried()
+                        throw CodexOAuthFetchError.unauthorized
+                    })
+            }
+            if index < 2 {
+                await Self.expectTransient(operation)
+            } else {
+                await Self.expectUnauthorized(operation)
+            }
+            #expect(await calls.renewals == min(index + 1, 3))
+            #expect(await calls.retries == min(index + 1, 3))
+        }
+        #expect(try fixture.snapshot().fingerprint == failed.fingerprint)
+    }
+
+    @Test
+    func `unchanged renewal succeeds when the scoped usage retry accepts the credential`() async throws {
+        let fixture = try Fixture()
+        let failed = try fixture.snapshot()
+        let calls = Calls()
+        let result = try await fixture.coordinator().recover(
+            home: fixture.home,
+            workspace: Fixture.workspace,
+            failed: failed,
+            env: fixture.env,
+            renew: { await calls.renewed() },
+            retry: { credentials in
+                await calls.retried()
+                #expect(credentials.accessToken == fixture.originalToken)
+                return Self.result()
+            })
+        #expect(result.sourceLabel == "oauth")
+        #expect(await calls.renewals == 1)
+        #expect(await calls.retries == 1)
+        #expect(try fixture.snapshot().fingerprint == failed.fingerprint)
+    }
+
+    @Test(arguments: ["timeout", "server", "lost-rpc-reply"])
+    func `post renewal transient failures retain the CLI credential without rollback`(failure: String) async throws {
+        let fixture = try Fixture()
+        let failed = try fixture.snapshot()
+        let calls = Calls()
+        let recovery = fixture.coordinator()
+        await Self.expectTransient {
+            try await recovery.recover(
+                home: fixture.home,
+                workspace: Fixture.workspace,
+                failed: failed,
+                env: fixture.env,
+                renew: {
+                    await calls.renewed()
+                    try fixture.rotate()
+                    if failure == "lost-rpc-reply" { throw URLError(.timedOut) }
+                }, retry: { _ in
+                    await calls.retried()
+                    if failure == "server" { throw CodexOAuthFetchError.serverError(503, "synthetic failure") }
+                    throw URLError(.timedOut)
+                })
+        }
+        #expect(await calls.renewals == 1)
+        #expect(await calls.retries == (failure == "lost-rpc-reply" ? 0 : 1))
+        let rotated = try fixture.snapshot()
+        #expect(rotated.credentials.accessToken == Fixture.token("rotated"))
+        #expect(rotated.credentials.refreshToken == "fixture-refresh-rotated")
+        #expect(rotated.fingerprint != failed.fingerprint)
+        await Self.expectTransient {
+            try await fixture.coordinator().recover(
+                home: fixture.home,
+                workspace: Fixture.workspace,
+                failed: rotated,
+                env: fixture.env,
+                renew: { await calls.renewed() },
+                retry: { _ in
+                    await calls.retried()
+                    return Self.result()
+                })
+        }
+        #expect(await calls.renewals == 1)
+    }
+
+    @Test
+    func `terminal authentication failure stops future renewal and usage retries until a new login`() async throws {
+        let fixture = try Fixture()
+        let failed = try fixture.snapshot()
+        let calls = Calls()
+        let now = Date()
+        await Self.expectUnauthorized {
+            try await fixture.coordinator().recover(
+                home: fixture.home,
+                workspace: Fixture.workspace,
+                failed: failed,
+                env: fixture.env,
+                now: now,
+                renew: {
+                    await calls.renewed()
+                    try fixture.rotate()
+                }, retry: { _ in
+                    await calls.retried()
+                    throw CodexOAuthFetchError.unauthorized
+                })
+        }
+        let rotated = try fixture.snapshot()
+        await Self.expectUnauthorized {
+            try await fixture.coordinator().recover(
+                home: fixture.home,
+                workspace: Fixture.workspace,
+                failed: rotated,
+                env: fixture.env,
+                now: now.addingTimeInterval(7200),
+                renew: { await calls.renewed() },
+                retry: { _ in
+                    await calls.retried()
+                    return Self.result()
+                })
+        }
+        #expect(await calls.renewals == 1)
+        #expect(await calls.retries == 1)
+
+        try fixture.rotate(generation: "new-login")
+        let login = try fixture.snapshot()
+        _ = try await fixture.coordinator().recover(
+            home: fixture.home,
+            workspace: Fixture.workspace,
+            failed: login,
+            env: fixture.env,
+            now: now.addingTimeInterval(7201),
+            renew: {
+                await calls.renewed()
+                try fixture.rotate(generation: "renewed-login")
+            }, retry: { _ in
+                await calls.retried()
+                return Self.result()
+            })
+        #expect(await calls.renewals == 2)
+        #expect(await calls.retries == 2)
+    }
+
+    @Test
+    func `invalid grant stops renewal immediately and preserves its safe reason across restart`() async throws {
+        let fixture = try Fixture()
+        let failed = try fixture.snapshot()
+        let calls = Calls()
+        let now = Date()
+        for elapsed in [0.0, 7200.0] {
+            do {
+                _ = try await fixture.coordinator().recover(
+                    home: fixture.home,
+                    workspace: Fixture.workspace,
+                    failed: failed,
+                    env: fixture.env,
+                    now: now.addingTimeInterval(elapsed),
+                    renew: {
+                        await calls.renewed()
+                        throw CodexCredentialRefreshError.authentication(.invalidGrant)
+                    }, retry: { _ in
+                        await calls.retried()
+                        return Self.result()
+                    })
+                Issue.record("Invalid grant must require a new login")
+            } catch {
+                let classified = try #require(error as? ProviderFetchClassifiedError)
+                #expect(classified.kind == .authenticationExpired)
+                #expect(classified.message.contains(CodexCredentialRefreshAuthReason.invalidGrant.rawValue))
+                #expect(!classified.message.contains(fixture.originalToken))
+                #expect(!classified.message.contains("fixture-refresh"))
+                #expect(!classified.message.contains(fixture.home.path))
+            }
+        }
+        #expect(await calls.renewals == 1)
+        #expect(await calls.retries == 0)
+        #expect(try fixture.snapshot().fingerprint == failed.fingerprint)
+    }
+
+    @Test(arguments: [false, true])
+    func `unknown RPC rejection and invalid response remain transient after restart`(
+        invalidResponse: Bool) async throws
+    {
+        let fixture = try Fixture()
+        let failed = try fixture.snapshot()
+        let calls = Calls()
+        let now = Date()
+        for elapsed in [0.0, 1.0, 31.0] {
+            await Self.expectTransient {
+                try await fixture.coordinator().recover(
+                    home: fixture.home,
+                    workspace: Fixture.workspace,
+                    failed: failed,
+                    env: fixture.env,
+                    now: now.addingTimeInterval(elapsed),
+                    renew: {
+                        await calls.renewed()
+                        throw invalidResponse
+                            ? CodexCredentialRefreshError.invalidResponse
+                            : CodexCredentialRefreshError.requestRejected
+                    }, retry: { _ in
+                        await calls.retried()
+                        return Self.result()
+                    })
+            }
+            #expect(await calls.renewals == (elapsed < 31 ? 1 : 2))
+        }
+        #expect(await calls.retries == 0)
+        #expect(try fixture.snapshot().fingerprint == failed.fingerprint)
+    }
+
+    @Test
+    func `transient backoff persists across instances and a new login fingerprint resets it`() async throws {
+        let fixture = try Fixture()
+        let failed = try fixture.snapshot()
+        let calls = Calls()
+        let now = Date()
+        for elapsed in [0.0, 1.0, 29.0, 31.0, 32.0, 90.0] {
+            await Self.expectTransient {
+                try await fixture.coordinator().recover(
+                    home: fixture.home,
+                    workspace: Fixture.workspace,
+                    failed: failed,
+                    env: fixture.env,
+                    now: now.addingTimeInterval(elapsed),
+                    renew: {
+                        await calls.renewed()
+                        throw URLError(.timedOut)
+                    }, retry: { _ in
+                        await calls.retried()
+                        return Self.result()
+                    })
+            }
+            #expect(await calls.renewals == (elapsed < 31 ? 1 : 2))
+        }
+        #expect(await calls.retries == 0)
+        try fixture.rotate(generation: "new-login")
+        let login = try fixture.snapshot()
+        _ = try await fixture.coordinator().recover(
+            home: fixture.home,
+            workspace: Fixture.workspace,
+            failed: login,
+            env: fixture.env,
+            now: now.addingTimeInterval(90),
+            renew: {
+                await calls.renewed()
+                try fixture.rotate(generation: "renewed-login")
+            }, retry: { _ in
+                await calls.retried()
+                return Self.result()
+            })
+        #expect(await calls.renewals == 3)
+        #expect(await calls.retries == 1)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: fixture.state.path).isEmpty)
+    }
+
+    @Test(arguments: [ProviderSourceMode.auto, .oauth])
+    func `managed OAuth retries a renewed token only once when usage still returns 401`(
+        mode: ProviderSourceMode) async throws
+    {
+        let fixture = try Fixture(expired: false)
+        let calls = Calls()
+        let transport = ProviderHTTPTransportStub { request in
+            #expect(request.value(forHTTPHeaderField: "ChatGPT-Account-Id") == Fixture.workspace)
+            return try Self.response(request, code: 401)
+        }
+        await CodexAuthenticatedHTTPTransport.$overrideForTesting.withValue(transport) {
+            for _ in 0..<2 {
+                await Self.expectUnauthorized {
+                    try await CodexOAuthFetchStrategy.fetchManagedWorkspace(
+                        Self.context(
+                            mode: mode,
+                            fixture: fixture),
+                        home: fixture.home,
+                        workspace: Fixture.workspace,
+                        recovery: fixture.coordinator(),
+                        renew: {
+                            await calls.renewed()
+                            try fixture.rotate()
+                        })
+                }
+            }
+        }
+        #expect(await calls.renewals == 1)
+        #expect(await transport.requests().count == 2)
+        #expect(try fixture.snapshot().credentials.accessToken == Fixture.token("rotated"))
+    }
+
+    @Test
+    func `simultaneous workspace 401 failures cap renewal concurrency across separate homes`() async throws {
+        let fixtures = try (0..<6).map { _ in try Fixture(expired: false) }
+        for (index, fixture) in fixtures.enumerated() {
+            try fixture.rotate(generation: "original-\(index)", owner: "workspace-\(index)")
+        }
+        let calls = Calls()
+        let transport = ProviderHTTPTransportStub { request in
+            let owner = try #require(request.value(forHTTPHeaderField: "ChatGPT-Account-Id"))
+            let index = try #require(Int(owner.replacingOccurrences(of: "workspace-", with: "")))
+            let authorization = request.value(forHTTPHeaderField: "Authorization")
+            if authorization == "Bearer \(Fixture.token("original-\(index)"))" {
+                return try Self.response(request, code: 401)
+            }
+            #expect(authorization == "Bearer \(Fixture.token("rotated-\(index)"))")
+            return try Self.response(request)
+        }
+        let results = try await CodexAuthenticatedHTTPTransport.$overrideForTesting.withValue(transport) {
+            try await withThrowingTaskGroup(of: Double?.self) { group in
+                for (index, fixture) in fixtures.enumerated() {
+                    group.addTask {
+                        let workspace = "workspace-\(index)"
+                        let context = Self.context(mode: .auto, fixture: fixture, workspace: workspace)
+                        let result = try await CodexOAuthFetchStrategy.fetchManagedWorkspace(
+                            context,
+                            home: fixture.home,
+                            workspace: workspace,
+                            recovery: fixture.coordinator(),
+                            renew: {
+                                await calls.beganRenewal()
+                                try await Task.sleep(for: .milliseconds(40))
+                                try fixture.rotate(generation: "rotated-\(index)", owner: workspace)
+                                await calls.finishedRenewal()
+                            })
+                        return result.usage.primary?.usedPercent
+                    }
+                }
+                var results: [Double?] = []
+                for try await result in group {
+                    results.append(result)
+                }
+                return results
+            }
+        }
+        #expect(results == Array(repeating: 22, count: fixtures.count))
+        #expect(await calls.renewals == fixtures.count)
+        #expect(await calls.maximumConcurrentRenewals <= 2)
+        #expect(await transport.requests().count == fixtures.count * 2)
+    }
+
+    private actor Calls {
+        var renewals = 0
+        var retries = 0
+        var activeRenewals = 0
+        var maximumConcurrentRenewals = 0
+
+        func beganRenewal() {
+            self.renewals += 1
+            self.activeRenewals += 1
+            self.maximumConcurrentRenewals = max(self.maximumConcurrentRenewals, self.activeRenewals)
+        }
+
+        func finishedRenewal() { self.activeRenewals -= 1 }
+
+        func renewed() { self.renewals += 1 }
+        func retried() { self.retries += 1 }
+    }
+
+    private struct Fixture: Sendable {
+        static let workspace = "fixture-workspace"
+        let home: URL
+        let state: URL
+        let originalToken: String
+
+        var env: [String: String] {
+            ["CODEX_HOME": self.home.path, "HOME": self.home.deletingLastPathComponent().path, "PATH": ""]
+        }
+
+        init(expired: Bool = true) throws {
+            let root = CodexCredentialFixtures.root.appendingPathComponent(UUID().uuidString)
+            self.home = root.appendingPathComponent("home")
+            self.state = root.appendingPathComponent("state")
+            self.originalToken = Self.token("original", expired: expired)
+            try FileManager.default.createDirectory(at: self.home, withIntermediateDirectories: true)
+            try self.rotate(generation: "original", expired: expired)
+        }
+
+        func coordinator() -> CodexManagedWorkspaceRefresh {
+            CodexManagedWorkspaceRefresh(stateDirectory: self.state)
+        }
+
+        func snapshot() throws -> CodexManagedWorkspaceRefresh.Snapshot {
+            try .read(env: self.env)
+        }
+
+        func rotate(
+            generation: String = "rotated",
+            owner: String = Self.workspace,
+            expired: Bool = false) throws
+        {
+            let data = try JSONSerialization.data(withJSONObject: [
+                "tokens": [
+                    "access_token": Self.token(generation, expired: expired),
+                    "refresh_token": "fixture-refresh-\(generation)",
+                    "account_id": owner,
+                ],
+                "last_refresh": "2000-01-01T00:00:00Z",
+            ], options: .sortedKeys)
+            try data.write(to: self.home.appendingPathComponent("auth.json"), options: .atomic)
+        }
+
+        static func token(_ generation: String, expired: Bool = false) -> String {
+            let payload = Data(#"{"exp":\#(expired ? 1 : 4_102_444_800)}"#.utf8).base64EncodedString()
+                .replacingOccurrences(of: "+", with: "-")
+                .replacingOccurrences(of: "/", with: "_")
+                .replacingOccurrences(of: "=", with: "")
+            return "fixture.\(payload).\(generation)"
+        }
+    }
+
+    private struct ManagedStrategy: ProviderFetchStrategy {
+        let fixture: Fixture
+        let recovery: CodexManagedWorkspaceRefresh
+        let renew: @Sendable () async throws -> Void
+        let id = "codex.oauth"
+        let kind: ProviderFetchKind = .oauth
+
+        func isAvailable(_ context: ProviderFetchContext) async -> Bool {
+            await CodexOAuthFetchStrategy().isAvailable(context)
+        }
+
+        func fetch(_ context: ProviderFetchContext) async throws -> ProviderFetchResult {
+            try await CodexOAuthFetchStrategy.fetchManagedWorkspace(
+                context,
+                home: self.fixture.home,
+                workspace: Fixture.workspace,
+                recovery: self.recovery,
+                renew: self.renew)
+        }
+
+        func shouldFallback(on error: Error, context: ProviderFetchContext) -> Bool {
+            CodexOAuthFetchStrategy().shouldFallback(on: error, context: context)
+        }
+    }
+
+    private struct UnavailableStrategy: ProviderFetchStrategy {
+        let id: String
+        let kind: ProviderFetchKind
+
+        func isAvailable(_: ProviderFetchContext) async -> Bool { false }
+
+        func fetch(_: ProviderFetchContext) async throws -> ProviderFetchResult {
+            Issue.record("Managed credential recovery must not use an unscoped fallback")
+            throw CodexOAuthFetchError.unauthorized
+        }
+
+        func shouldFallback(on _: Error, context _: ProviderFetchContext) -> Bool { false }
+    }
+
+    private static func context(
+        mode: ProviderSourceMode,
+        fixture: Fixture,
+        workspace: String = Fixture.workspace) -> ProviderFetchContext
+    {
+        let browserDetection = BrowserDetection(cacheTTL: 0)
+        return ProviderFetchContext(
+            runtime: .cli,
+            sourceMode: mode,
+            includeCredits: false,
+            webTimeout: 1,
+            webDebugDumpHTML: false,
+            verbose: false,
+            env: fixture.env,
+            settings: ProviderSettingsSnapshot.make(codex: CodexProviderSettings(
+                usageDataSource: mode == .auto ? .auto : .oauth,
+                cookieSource: .off,
+                manualCookieHeader: nil,
+                managedWorkspaceAccountID: workspace)),
+            fetcher: UsageFetcher(environment: fixture.env),
+            claudeFetcher: ClaudeUsageFetcher(browserDetection: browserDetection),
+            browserDetection: browserDetection)
+    }
+
+    private static func result() -> ProviderFetchResult {
+        ProviderFetchResult(
+            usage: UsageSnapshot(primary: nil, secondary: nil, updatedAt: Date()),
+            credits: nil,
+            dashboard: nil,
+            sourceLabel: "oauth",
+            strategyID: "codex.oauth",
+            strategyKind: .oauth)
+    }
+
+    private static func response(_ request: URLRequest, code: Int = 200) throws -> (Data, URLResponse) {
+        let url = try #require(request.url)
+        let response = try #require(HTTPURLResponse(
+            url: url, statusCode: code, httpVersion: nil, headerFields: nil))
+        let body = #"""
+        {"plan_type":"pro","rate_limit":{
+          "primary_window":{"used_percent":22,"reset_at":4102444800,"limit_window_seconds":18000}
+        }}
+        """#
+        return (Data(body.utf8), response)
+    }
+
+    private static func expectUnauthorized(_ operation: () async throws -> ProviderFetchResult) async {
+        do {
+            _ = try await operation()
+            Issue.record("Expected terminal authentication failure")
+        } catch {
+            #expect((error as? ProviderFetchClassifiedError)?.kind == .authenticationExpired)
+            #expect(!error.localizedDescription.contains("fixture-refresh"))
+            #expect(!error.localizedDescription.contains("Bearer"))
+        }
+    }
+
+    private static func expectTransient(_ operation: () async throws -> ProviderFetchResult) async {
+        do {
+            _ = try await operation()
+            Issue.record("Expected transient credential recovery failure")
+        } catch {
+            #expect(error is CodexManagedWorkspaceRefresh.RecoveryError)
+        }
+    }
+}
