@@ -779,7 +779,7 @@ struct CodexOAuthTests {
     }
 
     @Test
-    func `explicit O auth mode only falls back to CLI for native refresh recovery`() {
+    func `unscoped explicit OAuth only falls back to CLI usage for native refresh recovery`() {
         let strategy = CodexOAuthFetchStrategy()
         let context = self.makeContext(sourceMode: .oauth)
 

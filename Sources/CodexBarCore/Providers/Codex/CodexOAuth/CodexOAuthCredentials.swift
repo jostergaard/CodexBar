@@ -229,6 +229,10 @@ public enum CodexOAuthCredentialsStore {
         return CodexPATCredentials(token: token, source: source)
     }
 
+    static func nativeUsageData(env: [String: String]) throws -> Data {
+        try self.readAuthData(env: env)
+    }
+
     private static func readAuthData(
         env: [String: String],
         fileManager: FileManager = .default,

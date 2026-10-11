@@ -15,7 +15,7 @@ struct CodexOAuthExpiryPipelineTests {
         let reads = LockIsolated(0)
         let transport = ProviderHTTPTransportStub { request in
             #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer \(fresh.token)")
-            #expect(request.value(forHTTPHeaderField: "ChatGPT-Account-Id") == "fixture-workspace")
+            #expect(request.value(forHTTPHeaderField: "ChatGPT-Account-Id") == "fixture-account")
             return try Self.response(request, body: Self.usageBody)
         }
         let reader: Reader = { operation, url in
@@ -32,7 +32,7 @@ struct CodexOAuthExpiryPipelineTests {
         }
         let result = try await CodexCredentialFileAccess.$testIO.withValue(reader) {
             try await CodexAuthenticatedHTTPTransport.$overrideForTesting.withValue(transport) {
-                try await CodexOAuthFetchStrategy().fetch(Self.context(mode: .oauth, managed: true, home: fresh.home))
+                try await CodexOAuthFetchStrategy().fetch(Self.context(mode: .oauth, managed: false, home: fresh.home))
             }
         }
         #expect(result.usage.primary?.usedPercent == 22)
@@ -80,7 +80,7 @@ struct CodexOAuthExpiryPipelineTests {
             await CodexAuthenticatedHTTPTransport.$overrideForTesting.withValue(transport) {
                 do {
                     _ = try await CodexOAuthFetchStrategy().fetch(
-                        Self.context(mode: .oauth, managed: true, home: stale.home))
+                        Self.context(mode: .oauth, managed: false, home: stale.home))
                     Issue.record("Expected a credential error")
                 } catch let error as CodexOAuthCredentialsError {
                     switch (failure, error) {
@@ -112,7 +112,7 @@ struct CodexOAuthExpiryPipelineTests {
             return await CodexCredentialFileAccess.$testIO.withValue(reader) {
                 do {
                     _ = try await CodexOAuthFetchStrategy().fetch(
-                        Self.context(mode: .oauth, managed: true, home: fresh.home))
+                        Self.context(mode: .oauth, managed: false, home: fresh.home))
                     return false
                 } catch is CancellationError {
                     return true
@@ -140,9 +140,9 @@ struct CodexOAuthExpiryPipelineTests {
         await CodexAuthenticatedHTTPTransport.$overrideForTesting.withValue(transport) {
             let outcome = await Self.pipeline.fetch(context: context, provider: .codex)
             guard case let .failure(error) = outcome.result,
-                  case .nativeRefreshRequired = error as? CodexOAuthCredentialsError
+                  error is CodexManagedWorkspaceRefresh.RecoveryError
             else {
-                Issue.record("An expired managed credential requires owner renewal")
+                Issue.record("An expired managed credential defers after transient owner renewal failure")
                 return
             }
         }
@@ -263,13 +263,11 @@ struct CodexOAuthExpiryPipelineTests {
             }
             if managed {
                 guard case let .failure(error) = outcome.result,
-                      case .nativeRefreshRequired = error as? CodexOAuthCredentialsError
+                      error is CodexManagedWorkspaceRefresh.RecoveryError
                 else {
-                    Issue.record("Managed scope must retain nativeRefreshRequired without CLI recovery")
+                    Issue.record("Managed scope must retain transient renewal failure without unscoped fallback")
                     continue
                 }
-                #expect(!error.localizedDescription.contains("will retry"))
-                #expect(error.localizedDescription.contains("Codex home"))
                 #expect(outcome.attempts.filter { $0.kind == .cli && $0.wasAvailable }.isEmpty)
             } else {
                 guard case let .failure(error) = outcome.result, error is CLISelected else {
@@ -313,6 +311,9 @@ struct CodexOAuthExpiryPipelineTests {
         if expectsCLI {
             #expect(error is CLISelected)
             #expect(outcome.attempts.last?.strategyID == "codex.cli")
+        } else if managed, unauthorized {
+            #expect(error is CodexManagedWorkspaceRefresh.RecoveryError)
+            #expect(outcome.attempts.filter { $0.kind == .cli && $0.wasAvailable }.isEmpty)
         } else {
             let oauthError = try #require(error as? CodexOAuthFetchError)
             switch oauthError {
@@ -397,12 +398,39 @@ struct CodexOAuthExpiryPipelineTests {
         }
     }
 
-    /// Keep production selection, availability, OAuth file loading, mapping and fallback policy.
-    /// Only the actual CLI process is replaced with a sentinel to make recovery observable and offline.
+    /// Keep production selection and OAuth policy, but never launch a credential owner's CLI in these tests.
     private static let pipeline = ProviderFetchPipeline { context in
         let strategies = await CodexProviderDescriptor.descriptor.fetchPlan.pipeline.resolveStrategies(context)
         return strategies.map { strategy -> any ProviderFetchStrategy in
-            strategy.kind == .cli ? CLISelectionProbe(id: strategy.id) : strategy
+            if strategy.kind == .cli { return CLISelectionProbe(id: strategy.id) }
+            if strategy.id == "codex.oauth", context.codexWorkspaceID != nil {
+                return ManagedRenewalProbe()
+            }
+            return strategy
+        }
+    }
+
+    private struct ManagedRenewalProbe: ProviderFetchStrategy {
+        let id = "codex.oauth"
+        let kind: ProviderFetchKind = .oauth
+
+        func isAvailable(_ context: ProviderFetchContext) async -> Bool {
+            await CodexOAuthFetchStrategy().isAvailable(context)
+        }
+
+        func fetch(_ context: ProviderFetchContext) async throws -> ProviderFetchResult {
+            let home = try #require(CodexManagedWorkspaceRefresh.home(env: context.env))
+            let workspace = try #require(context.codexWorkspaceID)
+            return try await CodexOAuthFetchStrategy.fetchManagedWorkspace(
+                context,
+                home: home,
+                workspace: workspace,
+                recovery: CodexManagedWorkspaceRefresh(stateDirectory: home.appendingPathComponent("renewal-state")),
+                renew: { throw URLError(.timedOut) })
+        }
+
+        func shouldFallback(on error: Error, context: ProviderFetchContext) -> Bool {
+            CodexOAuthFetchStrategy().shouldFallback(on: error, context: context)
         }
     }
 
