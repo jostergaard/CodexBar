@@ -165,6 +165,7 @@ struct CodexManagedCredentialRenewalTests {
         }
         var iterator = renewalStarted.stream.makeAsyncIterator()
         _ = await iterator.next()
+        await renewalBlocker.waitForStarted(1)
         task.cancel()
         await renewalBlocker.release()
         await #expect(throws: CancellationError.self) { try await task.value }
@@ -258,11 +259,11 @@ struct CodexManagedCredentialRenewalTests {
         }
         await CodexManagedWorkspaceRefresh.waitForRenewalGateQueueForTesting()
         queuedTask.cancel()
+        await #expect(throws: CancellationError.self) { try await queuedTask.value }
         await blocker.release()
         for task in blockerTasks {
             _ = try await task.value
         }
-        await #expect(throws: CancellationError.self) { try await queuedTask.value }
         #expect(await calls.renewals == 0)
         #expect(try FileManager.default.contentsOfDirectory(atPath: queued.state.path).isEmpty)
     }
@@ -381,6 +382,27 @@ struct CodexManagedCredentialRenewalTests {
             })
         #expect(await calls.renewals == 2)
         #expect(await calls.retries == 1)
+    }
+
+    @Test
+    func `completed flights are removed for subsequent recovery on the same coordinator`() async throws {
+        let fixture = try Fixture()
+        let coordinator = fixture.coordinator()
+        let calls = Calls()
+        for _ in 0..<2 {
+            _ = try await coordinator.recover(
+                home: fixture.home,
+                workspace: Fixture.workspace,
+                failed: fixture.snapshot(),
+                env: fixture.env,
+                renew: { await calls.renewed() },
+                retry: { _ in
+                    await calls.retried()
+                    return Self.result()
+                })
+        }
+        #expect(await calls.renewals == 2)
+        #expect(await calls.retries == 2)
     }
 
     @Test
