@@ -529,6 +529,7 @@ struct CodexManagedCredentialRenewalTests {
                 "tokens": [
                     "access_token": Self.token(generation, expired: expired),
                     "refresh_token": "fixture-refresh-\(generation)",
+                    "id_token": Self.idToken(email: "fixture@example.test", subject: "fixture-subject"),
                     "account_id": owner,
                 ],
                 "last_refresh": "2000-01-01T00:00:00Z",
@@ -542,6 +543,14 @@ struct CodexManagedCredentialRenewalTests {
                 .replacingOccurrences(of: "/", with: "_")
                 .replacingOccurrences(of: "=", with: "")
             return "fixture.\(payload).\(generation)"
+        }
+
+        static func idToken(email: String, subject: String) -> String {
+            let payload = Data(#"{"email":"\#(email)","sub":"\#(subject)"}"#.utf8).base64EncodedString()
+                .replacingOccurrences(of: "+", with: "-")
+                .replacingOccurrences(of: "/", with: "_")
+                .replacingOccurrences(of: "=", with: "")
+            return "fixture.\(payload).signature"
         }
     }
 

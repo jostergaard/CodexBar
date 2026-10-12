@@ -427,11 +427,16 @@ struct CodexOAuthFetchStrategy: ProviderFetchStrategy {
             guard needsRefresh, snapshot.credentials.source == .codexHome, !snapshot.credentials.isAPIKey else {
                 throw error
             }
+            let expectedEmail = context.settings?.codex?.dashboardAuthorityKnownOwners.first {
+                if case let .providerAccount(id) = $0.identity { return id == workspace }
+                return false
+            }?.normalizedEmail
             return try await recovery.recover(
                 home: home,
                 workspace: workspace,
                 failed: snapshot,
                 env: context.env,
+                expectedEmail: expectedEmail,
                 renew: renew,
                 retry: { credentials in
                     try await Self.fetch(context: context, credentials: credentials, afterNativeRenewal: true)
