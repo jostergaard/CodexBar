@@ -302,7 +302,7 @@ actor CodexManagedWorkspaceRefresh {
             // Ownership mismatches are terminal even when auth.json changed while the gate was held.
             // Other authentication failures may be superseded by a new same-owner publication.
             let ownershipFailure = terminalReason == "ownershipMismatch"
-                || (error as? ProviderFetchClassifiedError)?.message.contains("ownershipMismatch") == true
+                && (expectedEmail != nil || expectedIdentity != nil)
             if ownershipFailure { terminalReason = "ownershipMismatch" }
             let authenticationFailure = ownershipFailure || (!changedDuringFailure && (terminalReason != nil
                 || (error as? ProviderFetchClassifiedError)?.kind == .authenticationExpired))
