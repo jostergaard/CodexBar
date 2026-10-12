@@ -141,7 +141,8 @@ struct CodexProviderSettingsBuilderTests {
             usageDataSource: .oauth, cookieSource: .off, manualCookieHeader: nil,
             reconciliationSnapshot: base,
             resolvedActiveSource: CodexResolvedActiveSource(
-                persistedSource: .profileHome(path: "/tmp/profile"), resolvedSource: .profileHome(path: "/tmp/profile"))))
+                persistedSource: .profileHome(path: "/tmp/profile"),
+                resolvedSource: .profileHome(path: "/tmp/profile"))))
         #expect(profileSettings.managedAccountExpectedEmail == nil)
     }
 

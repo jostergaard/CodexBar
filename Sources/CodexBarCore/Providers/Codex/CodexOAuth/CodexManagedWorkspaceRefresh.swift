@@ -17,6 +17,7 @@ private actor CodexCredentialRenewalGate {
     static let shared = CodexCredentialRenewalGate()
     private var active = 0
     private var waiters: [(id: UUID, continuation: CheckedContinuation<Void, Error>)] = []
+    private var testWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
 
     func run(_ operation: @Sendable () async throws -> Void) async throws {
         let waiterID = UUID()
@@ -27,6 +28,11 @@ private actor CodexCredentialRenewalGate {
             try await withTaskCancellationHandler {
                 try await withCheckedThrowingContinuation { continuation in
                     self.waiters.append((waiterID, continuation))
+                    self.testWaiters = self.testWaiters.filter { entry in
+                        guard self.waiters.count >= entry.count else { return true }
+                        entry.continuation.resume()
+                        return false
+                    }
                 }
             } onCancel: {
                 Task { await self.cancelWaiter(waiterID) }
@@ -50,6 +56,13 @@ private actor CodexCredentialRenewalGate {
         guard let index = self.waiters.firstIndex(where: { $0.id == id }) else { return }
         self.waiters.remove(at: index).continuation.resume(throwing: CancellationError())
     }
+
+    func waitUntilWaitingCount(_ count: Int) async {
+        guard self.waiters.count < count else { return }
+        await withCheckedContinuation { continuation in
+            self.testWaiters.append((count, continuation))
+        }
+    }
 }
 
 /// The CLI alone renews credentials. This coordinator never writes auth.json or consumes CLI usage.
@@ -70,10 +83,9 @@ actor CodexManagedWorkspaceRefresh {
 
         static func read(env: [String: String]) throws -> Self {
             let data = try CodexOAuthCredentialsStore.nativeUsageData(env: env)
-            let object = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-            let tokens = object?["tokens"] as? [String: Any]
-            let owner = (tokens?["account_id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            _ = try JSONSerialization.jsonObject(with: data) as? [String: Any]
             let credentials = try CodexOAuthCredentialsStore.parse(data: data)
+            let owner = credentials.accountId?.trimmingCharacters(in: .whitespacesAndNewlines)
             let subject: String? = if let idToken = credentials.idToken,
                                       let payload = UsageFetcher.parseJWT(idToken),
                                       let value = payload["sub"] as? String
@@ -88,8 +100,11 @@ actor CodexManagedWorkspaceRefresh {
             } else {
                 nil
             }
-            return Self(credentials: credentials, fingerprint: CodexManagedWorkspaceRefresh.digest(data), owner: owner,
-                        identity: identity)
+            return Self(
+                credentials: credentials,
+                fingerprint: CodexManagedWorkspaceRefresh.digest(data),
+                owner: owner,
+                identity: identity)
         }
     }
 
@@ -115,12 +130,71 @@ actor CodexManagedWorkspaceRefresh {
         let workspace: String
         let fingerprint: String
         let task: Task<ProviderFetchResult, Error>
-        var waiters: Int
+        var waiters: Set<UUID>
         var renewalStarted = false
     }
 
     private var flights: [String: Flight] = [:]
+    private var earlyRenewals: Set<UUID> = []
+    private var flightWaiterTests: [
+        (key: String, count: Int, continuation: CheckedContinuation<Void, Never>)
+    ] = []
     private let stateDirectory: URL
+
+    private func markRenewalStarted(key: String, id: UUID) {
+        guard var flight = self.flights[key], flight.id == id else {
+            self.earlyRenewals.insert(id)
+            return
+        }
+        flight.renewalStarted = true
+        self.flights[key] = flight
+    }
+
+    private func removeFlightWaiter(key: String, id: UUID, waiterID: UUID) {
+        guard var flight = self.flights[key], flight.id == id else { return }
+        flight.waiters.remove(waiterID)
+        if flight.waiters.isEmpty, !flight.renewalStarted {
+            self.flights[key] = nil
+        } else {
+            self.flights[key] = flight
+        }
+        self.signalFlightWaiters(key: key)
+    }
+
+    private func signalFlightWaiters(key: String) {
+        self.flightWaiterTests = self.flightWaiterTests.filter { entry in
+            guard entry.key == key, self.flights[key]?.waiters.count ?? 0 >= entry.count else { return true }
+            entry.continuation.resume()
+            return false
+        }
+    }
+
+    private func cancelFlightWaiter(key: String, id: UUID, waiterID: UUID) {
+        guard var flight = self.flights[key], flight.id == id,
+              flight.waiters.remove(waiterID) != nil
+        else { return }
+        if flight.waiters.isEmpty, !flight.renewalStarted {
+            flight.task.cancel()
+            self.flights[key] = nil
+        } else {
+            self.flights[key] = flight
+        }
+    }
+
+    private func awaitFlight(
+        key: String,
+        flight: Flight,
+        waiterID: UUID) async throws -> ProviderFetchResult
+    {
+        try await withTaskCancellationHandler {
+            defer { self.removeFlightWaiter(key: key, id: flight.id, waiterID: waiterID) }
+            let result = try await flight.task.value
+            try Task.checkCancellation()
+            return result
+        } onCancel: {
+            Task { await self.cancelFlightWaiter(key: key, id: flight.id, waiterID: waiterID) }
+        }
+    }
 
     init(stateDirectory: URL? = nil) {
         self.stateDirectory = stateDirectory ?? FileManager.default
@@ -151,17 +225,26 @@ actor CodexManagedWorkspaceRefresh {
         let key = home.standardizedFileURL.resolvingSymlinksInPath().path
         try Task.checkCancellation()
         if let flight = self.flights[key] {
+            let waiterID = UUID()
+            var joined = flight
+            joined.waiters.insert(waiterID)
+            self.flights[key] = joined
+            self.signalFlightWaiters(key: key)
             if flight.workspace == workspace, flight.fingerprint == failed.fingerprint {
-                return try await flight.task.value
+                return try await self.awaitFlight(key: key, flight: joined, waiterID: waiterID)
             }
-            _ = try? await flight.task.value
-            if self.flights[key]?.id == flight.id { self.flights[key] = nil }
+            do {
+                _ = try await self.awaitFlight(key: key, flight: joined, waiterID: waiterID)
+            } catch {
+                if Task.isCancelled { throw error }
+            }
             return try await self.recover(
                 home: home, workspace: workspace, failed: failed, env: env, now: now, expectedEmail: expectedEmail,
                 renew: renew, retry: retry)
         }
         let stateURL = self.stateURL(home: home, workspace: workspace)
         let id = UUID()
+        let waiterID = UUID()
         try Task.checkCancellation()
         let task = Task {
             try await Self.perform(
@@ -172,15 +255,32 @@ actor CodexManagedWorkspaceRefresh {
                 stateURL: stateURL,
                 now: now,
                 expectedEmail: expectedEmail,
+                renewalStarted: { await self.markRenewalStarted(key: key, id: id) },
                 renew: renew,
                 retry: retry)
         }
         self.flights[key] = Flight(
-            id: id, workspace: workspace, fingerprint: failed.fingerprint, task: task, waiters: 1)
-        defer {
-            if self.flights[key]?.id == id { self.flights[key] = nil }
+            id: id,
+            workspace: workspace,
+            fingerprint: failed.fingerprint,
+            task: task,
+            waiters: [waiterID],
+            renewalStarted: self.earlyRenewals.remove(id) != nil)
+        self.signalFlightWaiters(key: key)
+        return try await self.awaitFlight(key: key, flight: self.flights[key]!, waiterID: waiterID)
+    }
+
+    static func waitForRenewalGateQueueForTesting() async {
+        await CodexCredentialRenewalGate.shared.waitUntilWaitingCount(1)
+    }
+
+    func waitForFlightWaitersForTesting(home: URL, count: Int) async {
+        let key = home.standardizedFileURL.resolvingSymlinksInPath().path
+        guard self.flights[key]?.waiters.count ?? 0 < count else { return }
+        await withCheckedContinuation { continuation in
+            self.flightWaiterTests.append((key: key, count: count, continuation: continuation))
+            self.signalFlightWaiters(key: key)
         }
-        return try await task.value
     }
 
     func checkTerminalFailure(home: URL, workspace: String, fingerprint: String) throws {
@@ -219,6 +319,7 @@ actor CodexManagedWorkspaceRefresh {
         stateURL: URL,
         now: Date,
         expectedEmail: String?,
+        renewalStarted: @escaping @Sendable () async -> Void,
         renew: @Sendable () async throws -> Void,
         retry: @Sendable (CodexOAuthCredentials) async throws -> ProviderFetchResult) async throws
         -> ProviderFetchResult
@@ -257,10 +358,13 @@ actor CodexManagedWorkspaceRefresh {
                 try self.writeState(state!, at: stateURL)
                 try await CodexCredentialRenewalGate.shared.run {
                     let queued = try Snapshot.read(env: env)
-                    guard self.identityIsValid(queued.identity, expectedEmail: expectedEmail, fallback: failed.identity) else {
+                    guard self
+                        .identityIsValid(queued.identity, expectedEmail: expectedEmail, fallback: failed.identity)
+                    else {
                         throw self.authenticationError("ownershipMismatch")
                     }
                     if queued.fingerprint == failed.fingerprint {
+                        await renewalStarted()
                         try await renew()
                     }
                 }
@@ -268,7 +372,8 @@ actor CodexManagedWorkspaceRefresh {
                 unconfirmedRenewal = latest.fingerprint == failed.fingerprint
             }
             guard self.identityIsValid(latest.identity, expectedEmail: expectedEmail, fallback: failed.identity),
-                  !latest.credentials.isAPIKey else {
+                  !latest.credentials.isAPIKey
+            else {
                 terminalReason = "ownershipMismatch"
                 throw self.authenticationError("ownershipMismatch")
             }
@@ -292,12 +397,21 @@ actor CodexManagedWorkspaceRefresh {
             try? FileManager.default.removeItem(at: stateURL)
             return result
         } catch {
+            if error is CancellationError || Task.isCancelled {
+                try? FileManager.default.removeItem(at: stateURL)
+                throw error
+            }
             // The CLI may have persisted a rotation even if its RPC reply was lost. Never roll it back.
             let current = try? Snapshot.read(env: env)
             let changedDuringFailure = current.map { $0.fingerprint != latest.fingerprint } ?? false
             if let current { latest = current }
             if case let .authentication(reason) = error as? CodexCredentialRefreshError {
                 terminalReason = reason.rawValue
+            } else if let classified = error as? ProviderFetchClassifiedError,
+                      classified.kind == .authenticationExpired,
+                      classified.message.contains("ownershipMismatch")
+            {
+                terminalReason = "ownershipMismatch"
             }
             // Ownership mismatches are terminal even when auth.json changed while the gate was held.
             // Other authentication failures may be superseded by a new same-owner publication.
@@ -305,7 +419,8 @@ actor CodexManagedWorkspaceRefresh {
                 && (expectedEmail != nil || expectedIdentity != nil)
             if ownershipFailure { terminalReason = "ownershipMismatch" }
             let authenticationFailure = ownershipFailure || (!changedDuringFailure && (
-                (terminalReason != nil && (terminalReason != "ownershipMismatch" || expectedEmail != nil || expectedIdentity != nil))
+                (terminalReason != nil &&
+                    (terminalReason != "ownershipMismatch" || expectedEmail != nil || expectedIdentity != nil))
                     || (error as? ProviderFetchClassifiedError)?.kind == .authenticationExpired))
             var failure = state ?? State(
                 fingerprint: latest.fingerprint,
