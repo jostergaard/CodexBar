@@ -557,7 +557,9 @@ struct CodexManagedCredentialRenewalTests {
         #expect(await calls.retries == 1)
         #expect(try fixture.snapshot().fingerprint == failed.fingerprint)
     }
+}
 
+extension CodexManagedCredentialRenewalTests {
     @Test(arguments: ["timeout", "server", "lost-rpc-reply"])
     func `post renewal transient failures retain the CLI credential without rollback`(failure: String) async throws {
         let fixture = try Fixture()
@@ -852,7 +854,9 @@ struct CodexManagedCredentialRenewalTests {
         #expect(await calls.maximumConcurrentRenewals <= 2)
         #expect(await transport.requests().count == fixtures.count * 2)
     }
+}
 
+extension CodexManagedCredentialRenewalTests {
     private actor RenewalBlocker {
         private var started = 0
         private var startedWaiters: [CheckedContinuation<Void, Never>] = []

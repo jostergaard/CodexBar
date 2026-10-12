@@ -229,8 +229,14 @@ actor CodexManagedWorkspaceRefresh {
                 if Task.isCancelled { throw error }
             }
             return try await self.recover(
-                home: home, workspace: workspace, failed: failed, env: env, now: now, expectedEmail: expectedEmail,
-                renew: renew, retry: retry)
+                home: home,
+                workspace: workspace,
+                failed: failed,
+                env: env,
+                now: now,
+                expectedEmail: expectedEmail,
+                renew: renew,
+                retry: retry)
         }
         let stateURL = self.stateURL(home: home, workspace: workspace)
         let id = UUID()
