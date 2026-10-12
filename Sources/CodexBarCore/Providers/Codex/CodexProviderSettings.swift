@@ -13,6 +13,7 @@ public struct CodexProviderSettings: Sendable {
     /// Selected workspace identity stored in CodexBar's managed-account metadata. It is sent as
     /// an account header without rewriting the Codex-owned auth.json.
     public let managedWorkspaceAccountID: String?
+    public let managedAccountExpectedEmail: String?
 
     public init(
         usageDataSource: CodexUsageDataSource,
@@ -24,7 +25,8 @@ public struct CodexProviderSettings: Sendable {
         openAIWebCacheScope: CookieHeaderCache.Scope? = nil,
         dashboardAuthorityKnownOwners: [CodexDashboardKnownOwnerCandidate] = [],
         allowExternalOAuthSources: Bool = false,
-        managedWorkspaceAccountID: String? = nil)
+        managedWorkspaceAccountID: String? = nil,
+        managedAccountExpectedEmail: String? = nil)
     {
         self.usageDataSource = usageDataSource
         self.cookieSource = cookieSource
@@ -36,6 +38,7 @@ public struct CodexProviderSettings: Sendable {
         self.dashboardAuthorityKnownOwners = dashboardAuthorityKnownOwners
         self.allowExternalOAuthSources = allowExternalOAuthSources
         self.managedWorkspaceAccountID = managedWorkspaceAccountID
+        self.managedAccountExpectedEmail = CodexIdentityResolver.normalizeEmail(managedAccountExpectedEmail)
     }
 }
 
