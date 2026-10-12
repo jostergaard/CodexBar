@@ -48,9 +48,9 @@ struct CodexManagedCredentialRenewalTests {
 
     @Test
     func `alternate selected workspace recovers while preserving selected usage header`() async throws {
-        let fixture = try Fixture()
+        let fixture = try Fixture(expired: false)
         try fixture.rotate(
-            generation: "original", owner: "native-default", email: "fixture@example.test", expired: true)
+            generation: "original", owner: "native-default", email: "fixture@example.test", expired: false)
         let calls = Calls()
         let transport = ProviderHTTPTransportStub { request in
             #expect(request.value(forHTTPHeaderField: "ChatGPT-Account-Id") == "selected-workspace")
@@ -174,14 +174,14 @@ struct CodexManagedCredentialRenewalTests {
         let blockers = try (0..<2).map { _ in try Fixture() }
         let queued = try Fixture()
         let blocker = RenewalBlocker()
-        let blockerTasks = try blockers.map { fixture in
+        let blockerTasks = blockers.map { fixture in
             Task {
                 try await fixture.coordinator().recover(
                     home: fixture.home,
                     workspace: Fixture.workspace,
                     failed: try fixture.snapshot(),
                     env: fixture.env,
-                    renew: { try await blocker.enterAndWait() },
+                    renew: { await blocker.enterAndWait() },
                     retry: { _ in Self.result() })
             }
         }
@@ -193,6 +193,7 @@ struct CodexManagedCredentialRenewalTests {
                 workspace: Fixture.workspace,
                 failed: try queued.snapshot(),
                 env: queued.env,
+                expectedEmail: queued.email,
                 renew: { await queuedCalls.renewed() },
                 retry: { _ in
                     await queuedCalls.retried()
@@ -209,7 +210,12 @@ struct CodexManagedCredentialRenewalTests {
         for task in blockerTasks {
             _ = try await task.value
         }
-        await Self.expectUnauthorized { try await queuedTask.value }
+        do {
+            _ = try await queuedTask.value
+            Issue.record("Queued ownership mismatch must fail")
+        } catch {
+            #expect(error is CodexManagedWorkspaceRefresh.RecoveryError || error is ProviderFetchClassifiedError)
+        }
         #expect(await queuedCalls.renewals == 0)
         #expect(await queuedCalls.retries == 0)
     }
@@ -225,6 +231,7 @@ struct CodexManagedCredentialRenewalTests {
                 workspace: Fixture.workspace,
                 failed: failed,
                 env: fixture.env,
+                expectedEmail: fixture.email,
                 renew: {
                     await calls.renewed()
                     try fixture.rotate(owner: "different-owner")
@@ -687,11 +694,11 @@ struct CodexManagedCredentialRenewalTests {
         private var startedWaiters: [CheckedContinuation<Void, Never>] = []
         private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
 
-        func enterAndWait() async throws {
+        func enterAndWait() async {
             self.started += 1
             self.startedWaiters.forEach { $0.resume() }
             self.startedWaiters.removeAll()
-            try await withTaskCancellationHandler {
+            await withTaskCancellationHandler {
                 await withCheckedContinuation { continuation in
                     self.releaseWaiters.append(continuation)
                 }
