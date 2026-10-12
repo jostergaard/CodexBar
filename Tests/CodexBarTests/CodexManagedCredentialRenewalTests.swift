@@ -132,7 +132,7 @@ struct CodexManagedCredentialRenewalTests {
             try await fixture.coordinator().recover(
                 home: fixture.home,
                 workspace: Fixture.workspace,
-                failed: try fixture.snapshot(),
+                failed: fixture.snapshot(),
                 env: fixture.env,
                 expectedEmail: "not-the-selected-account@example.test",
                 renew: { await calls.renewed() },
@@ -146,6 +146,128 @@ struct CodexManagedCredentialRenewalTests {
     }
 
     @Test
+    func `cancelled renewal does not write state and next recovery proceeds`() async throws {
+        let fixture = try Fixture()
+        let renewalBlocker = RenewalBlocker()
+        let renewalStarted = AsyncStream<Void>.makeStream()
+        let task = Task {
+            try await fixture.coordinator().recover(
+                home: fixture.home,
+                workspace: Fixture.workspace,
+                failed: fixture.snapshot(),
+                env: fixture.env,
+                renew: {
+                    renewalStarted.continuation.yield()
+                    await renewalBlocker.enterAndWait()
+                    try fixture.rotate()
+                },
+                retry: { _ in Self.result() })
+        }
+        var iterator = renewalStarted.stream.makeAsyncIterator()
+        _ = await iterator.next()
+        task.cancel()
+        await renewalBlocker.release()
+        await #expect(throws: CancellationError.self) { try await task.value }
+        #expect(try fixture.snapshot().credentials.accessToken == Fixture.token("rotated"))
+        let stateFiles = (try? FileManager.default.contentsOfDirectory(
+            at: fixture.state,
+            includingPropertiesForKeys: nil)) ?? []
+        #expect(stateFiles.isEmpty)
+        _ = try await fixture.coordinator().recover(
+            home: fixture.home,
+            workspace: Fixture.workspace,
+            failed: fixture.snapshot(),
+            env: fixture.env,
+            renew: {},
+            retry: { _ in Self.result() })
+    }
+
+    @Test
+    func `cancelling one joined waiter leaves the other successful`() async throws {
+        let fixture = try Fixture()
+        let blocker = RenewalBlocker()
+        let started = AsyncStream<Void>.makeStream()
+        let calls = Calls()
+        let coordinator = fixture.coordinator()
+        let first = Task {
+            try await coordinator.recover(
+                home: fixture.home,
+                workspace: Fixture.workspace,
+                failed: fixture.snapshot(),
+                env: fixture.env,
+                renew: {
+                    started.continuation.yield()
+                    await blocker.enterAndWait()
+                    try fixture.rotate()
+                },
+                retry: { _ in
+                    await calls.retried()
+                    return Self.result()
+                })
+        }
+        var iterator = started.stream.makeAsyncIterator()
+        _ = await iterator.next()
+        let second = Task {
+            try await coordinator.recover(
+                home: fixture.home,
+                workspace: Fixture.workspace,
+                failed: fixture.snapshot(),
+                env: fixture.env,
+                renew: { await calls.renewed() },
+                retry: { _ in
+                    await calls.retried()
+                    return Self.result()
+                })
+        }
+        await coordinator.waitForFlightWaitersForTesting(home: fixture.home, count: 2)
+        first.cancel()
+        await blocker.release()
+        await #expect(throws: CancellationError.self) { try await first.value }
+        _ = try await second.value
+        #expect(await calls.renewals == 0)
+        #expect(await calls.retries == 1)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: fixture.state.path).isEmpty)
+    }
+
+    @Test
+    func `cancelling only queued waiter prevents renewal and state`() async throws {
+        let blockers = try (0..<2).map { _ in try Fixture() }
+        let queued = try Fixture()
+        let blocker = RenewalBlocker()
+        let blockerTasks = blockers.map { fixture in
+            Task {
+                try await fixture.coordinator().recover(
+                    home: fixture.home,
+                    workspace: Fixture.workspace,
+                    failed: fixture.snapshot(),
+                    env: fixture.env,
+                    renew: { await blocker.enterAndWait() },
+                    retry: { _ in Self.result() })
+            }
+        }
+        await blocker.waitForStarted(2)
+        let calls = Calls()
+        let queuedTask = Task {
+            try await queued.coordinator().recover(
+                home: queued.home,
+                workspace: Fixture.workspace,
+                failed: queued.snapshot(),
+                env: queued.env,
+                renew: { await calls.renewed() },
+                retry: { _ in Self.result() })
+        }
+        await CodexManagedWorkspaceRefresh.waitForRenewalGateQueueForTesting()
+        queuedTask.cancel()
+        await blocker.release()
+        for task in blockerTasks {
+            _ = try await task.value
+        }
+        await #expect(throws: CancellationError.self) { try await queuedTask.value }
+        #expect(await calls.renewals == 0)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: queued.state.path).isEmpty)
+    }
+
+    @Test
     func `already cancelled recovery does not renew retry or write state`() async throws {
         let fixture = try Fixture()
         let calls = Calls()
@@ -153,7 +275,7 @@ struct CodexManagedCredentialRenewalTests {
             try await fixture.coordinator().recover(
                 home: fixture.home,
                 workspace: Fixture.workspace,
-                failed: try fixture.snapshot(),
+                failed: fixture.snapshot(),
                 env: fixture.env,
                 renew: { await calls.renewed() },
                 retry: { _ in
@@ -165,7 +287,9 @@ struct CodexManagedCredentialRenewalTests {
         await #expect(throws: CancellationError.self) { try await task.value }
         #expect(await calls.renewals == 0)
         #expect(await calls.retries == 0)
-        let stateFiles = (try? FileManager.default.contentsOfDirectory(at: fixture.state, includingPropertiesForKeys: nil)) ?? []
+        let stateFiles = (try? FileManager.default.contentsOfDirectory(
+            at: fixture.state,
+            includingPropertiesForKeys: nil)) ?? []
         #expect(stateFiles.isEmpty)
     }
 
@@ -179,7 +303,7 @@ struct CodexManagedCredentialRenewalTests {
                 try await fixture.coordinator().recover(
                     home: fixture.home,
                     workspace: Fixture.workspace,
-                    failed: try fixture.snapshot(),
+                    failed: fixture.snapshot(),
                     env: fixture.env,
                     renew: { await blocker.enterAndWait() },
                     retry: { _ in Self.result() })
@@ -191,7 +315,7 @@ struct CodexManagedCredentialRenewalTests {
             try await queued.coordinator().recover(
                 home: queued.home,
                 workspace: Fixture.workspace,
-                failed: try queued.snapshot(),
+                failed: queued.snapshot(),
                 env: queued.env,
                 expectedEmail: queued.email,
                 renew: { await queuedCalls.renewed() },
@@ -200,11 +324,7 @@ struct CodexManagedCredentialRenewalTests {
                     return Self.result()
                 })
         }
-        for _ in 0..<1000 {
-            let count = (try? FileManager.default.contentsOfDirectory(at: queued.state, includingPropertiesForKeys: nil).count) ?? 0
-            if count >= 3 { break }
-            await Task.yield()
-        }
+        await CodexManagedWorkspaceRefresh.waitForRenewalGateQueueForTesting()
         try queued.rotate(owner: "different-owner")
         await blocker.release()
         for task in blockerTasks {
@@ -213,8 +333,11 @@ struct CodexManagedCredentialRenewalTests {
         do {
             _ = try await queuedTask.value
             Issue.record("Queued ownership mismatch must fail")
+        } catch let error as ProviderFetchClassifiedError {
+            #expect(error.kind == .authenticationExpired)
+            #expect(error.message.contains("ownershipMismatch"))
         } catch {
-            #expect(error is CodexManagedWorkspaceRefresh.RecoveryError || error is ProviderFetchClassifiedError)
+            Issue.record("Queued ownership mismatch must remain terminal")
         }
         #expect(await queuedCalls.renewals == 0)
         #expect(await queuedCalls.retries == 0)
@@ -257,6 +380,25 @@ struct CodexManagedCredentialRenewalTests {
                 return Self.result()
             })
         #expect(await calls.renewals == 2)
+        #expect(await calls.retries == 1)
+    }
+
+    @Test
+    func `camel case account identity remains eligible for renewal`() async throws {
+        let fixture = try Fixture()
+        try fixture.rotate(camelCaseAccountID: true)
+        let calls = Calls()
+        _ = try await fixture.coordinator().recover(
+            home: fixture.home,
+            workspace: Fixture.workspace,
+            failed: fixture.snapshot(),
+            env: fixture.env,
+            renew: { await calls.renewed() },
+            retry: { _ in
+                await calls.retried()
+                return Self.result()
+            })
+        #expect(await calls.renewals == 1)
         #expect(await calls.retries == 1)
     }
 
@@ -775,15 +917,18 @@ struct CodexManagedCredentialRenewalTests {
             owner: String = Self.workspace,
             email: String = "fixture@example.test",
             subject: String = "fixture-subject",
-            expired: Bool = false) throws
+            expired: Bool = false,
+            camelCaseAccountID: Bool = false) throws
         {
+            let tokenFields: [String: String] = [
+                "access_token": Self.token(generation, expired: expired),
+                "refresh_token": "fixture-refresh-\(generation)",
+                "id_token": Self.idToken(email: email, subject: subject),
+            ]
+            var tokens = tokenFields
+            tokens[camelCaseAccountID ? "accountId" : "account_id"] = owner
             let data = try JSONSerialization.data(withJSONObject: [
-                "tokens": [
-                    "access_token": Self.token(generation, expired: expired),
-                    "refresh_token": "fixture-refresh-\(generation)",
-                    "id_token": Self.idToken(email: email, subject: subject),
-                    "account_id": owner,
-                ],
+                "tokens": tokens,
                 "last_refresh": "2000-01-01T00:00:00Z",
             ], options: .sortedKeys)
             try data.write(to: self.home.appendingPathComponent("auth.json"), options: .atomic)

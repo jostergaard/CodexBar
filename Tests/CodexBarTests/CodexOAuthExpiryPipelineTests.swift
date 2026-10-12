@@ -481,8 +481,19 @@ struct CodexOAuthExpiryPipelineTests {
             .replacingOccurrences(of: "/", with: "_")
             .replacingOccurrences(of: "=", with: "")
         let token = "fixture.\(payload).signature"
+        let identityPayload = Data(#"{"email":"fixture@example.test","sub":"fixture-subject"}"#.utf8)
+            .base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        let idToken = "fixture.\(identityPayload).signature"
         let data = try JSONSerialization.data(withJSONObject: [
-            "tokens": ["access_token": token, "refresh_token": "fixture-refresh", "account_id": "fixture-account"],
+            "tokens": [
+                "access_token": token,
+                "refresh_token": "fixture-refresh",
+                "id_token": idToken,
+                "account_id": "fixture-account",
+            ],
             "last_refresh": lastRefresh,
         ])
         let url = home.appendingPathComponent("auth.json")
