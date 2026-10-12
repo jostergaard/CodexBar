@@ -20,7 +20,10 @@ private actor CodexCredentialRenewalGate {
 
     func run(_ operation: @Sendable () async throws -> Void) async throws {
         let waiterID = UUID()
-        if self.active >= 2 {
+        var acquired = self.active < 2
+        if acquired {
+            self.active += 1
+        } else {
             try await withTaskCancellationHandler {
                 try await withCheckedThrowingContinuation { continuation in
                     self.waiters.append((waiterID, continuation))
@@ -28,14 +31,15 @@ private actor CodexCredentialRenewalGate {
             } onCancel: {
                 Task { await self.cancelWaiter(waiterID) }
             }
-        } else {
-            self.active += 1
+            acquired = true
         }
         defer {
-            if self.waiters.isEmpty {
-                self.active -= 1
-            } else {
-                self.waiters.removeFirst().continuation.resume()
+            if acquired {
+                if self.waiters.isEmpty {
+                    self.active -= 1
+                } else {
+                    self.waiters.removeFirst().continuation.resume()
+                }
             }
         }
         try Task.checkCancellation()
