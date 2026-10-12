@@ -16,11 +16,18 @@ import Musl
 private actor CodexCredentialRenewalGate {
     static let shared = CodexCredentialRenewalGate()
     private var active = 0
-    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var waiters: [(id: UUID, continuation: CheckedContinuation<Void, Error>)] = []
 
     func run(_ operation: @Sendable () async throws -> Void) async throws {
+        let waiterID = UUID()
         if self.active >= 2 {
-            await withCheckedContinuation { self.waiters.append($0) }
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { continuation in
+                    self.waiters.append((waiterID, continuation))
+                }
+            } onCancel: {
+                Task { await self.cancelWaiter(waiterID) }
+            }
         } else {
             self.active += 1
         }
@@ -28,11 +35,16 @@ private actor CodexCredentialRenewalGate {
             if self.waiters.isEmpty {
                 self.active -= 1
             } else {
-                self.waiters.removeFirst().resume()
+                self.waiters.removeFirst().continuation.resume()
             }
         }
         try Task.checkCancellation()
         try await operation()
+    }
+
+    private func cancelWaiter(_ id: UUID) {
+        guard let index = self.waiters.firstIndex(where: { $0.id == id }) else { return }
+        self.waiters.remove(at: index).continuation.resume(throwing: CancellationError())
     }
 }
 
@@ -41,18 +53,39 @@ actor CodexManagedWorkspaceRefresh {
     static let shared = CodexManagedWorkspaceRefresh()
 
     struct Snapshot: Sendable {
+        struct Identity: Equatable, Sendable {
+            let accountID: String
+            let email: String
+            let subject: String?
+        }
+
         let credentials: CodexOAuthCredentials
         let fingerprint: String
         let owner: String?
+        let identity: Identity?
 
         static func read(env: [String: String]) throws -> Self {
             let data = try CodexOAuthCredentialsStore.nativeUsageData(env: env)
             let object = try JSONSerialization.jsonObject(with: data) as? [String: Any]
             let tokens = object?["tokens"] as? [String: Any]
-            return try Self(
-                credentials: CodexOAuthCredentialsStore.parse(data: data),
-                fingerprint: CodexManagedWorkspaceRefresh.digest(data),
-                owner: (tokens?["account_id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines))
+            let owner = (tokens?["account_id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let credentials = try CodexOAuthCredentialsStore.parse(data: data)
+            let subject: String? = if let idToken = credentials.idToken,
+                                      let payload = UsageFetcher.parseJWT(idToken),
+                                      let value = payload["sub"] as? String
+            {
+                value.trimmingCharacters(in: .whitespacesAndNewlines)
+            } else {
+                nil
+            }
+            let email = CodexNativeCredentialOwnerIdentity.normalizedEmail(fromIDToken: credentials.idToken)
+            let identity: Identity? = if let owner, !owner.isEmpty, let email {
+                Self.Identity(accountID: owner, email: email, subject: subject?.isEmpty == true ? nil : subject)
+            } else {
+                nil
+            }
+            return Self(credentials: credentials, fingerprint: CodexManagedWorkspaceRefresh.digest(data), owner: owner,
+                        identity: identity)
         }
     }
 
@@ -78,6 +111,8 @@ actor CodexManagedWorkspaceRefresh {
         let workspace: String
         let fingerprint: String
         let task: Task<ProviderFetchResult, Error>
+        var waiters: Int
+        var renewalStarted = false
     }
 
     private var flights: [String: Flight] = [:]
@@ -104,11 +139,13 @@ actor CodexManagedWorkspaceRefresh {
         failed: Snapshot,
         env: [String: String],
         now: Date = Date(),
+        expectedEmail: String? = nil,
         renew: @escaping @Sendable () async throws -> Void,
         retry: @escaping @Sendable (CodexOAuthCredentials) async throws -> ProviderFetchResult) async throws
         -> ProviderFetchResult
     {
         let key = home.standardizedFileURL.resolvingSymlinksInPath().path
+        try Task.checkCancellation()
         if let flight = self.flights[key] {
             if flight.workspace == workspace, flight.fingerprint == failed.fingerprint {
                 return try await flight.task.value
@@ -116,10 +153,12 @@ actor CodexManagedWorkspaceRefresh {
             _ = try? await flight.task.value
             if self.flights[key]?.id == flight.id { self.flights[key] = nil }
             return try await self.recover(
-                home: home, workspace: workspace, failed: failed, env: env, now: now, renew: renew, retry: retry)
+                home: home, workspace: workspace, failed: failed, env: env, now: now, expectedEmail: expectedEmail,
+                renew: renew, retry: retry)
         }
         let stateURL = self.stateURL(home: home, workspace: workspace)
         let id = UUID()
+        try Task.checkCancellation()
         let task = Task {
             try await Self.perform(
                 home: URL(fileURLWithPath: key),
@@ -128,10 +167,12 @@ actor CodexManagedWorkspaceRefresh {
                 env: env,
                 stateURL: stateURL,
                 now: now,
+                expectedEmail: expectedEmail,
                 renew: renew,
                 retry: retry)
         }
-        self.flights[key] = Flight(id: id, workspace: workspace, fingerprint: failed.fingerprint, task: task)
+        self.flights[key] = Flight(
+            id: id, workspace: workspace, fingerprint: failed.fingerprint, task: task, waiters: 1)
         defer {
             if self.flights[key]?.id == id { self.flights[key] = nil }
         }
@@ -173,6 +214,7 @@ actor CodexManagedWorkspaceRefresh {
         env: [String: String],
         stateURL: URL,
         now: Date,
+        expectedEmail: String?,
         renew: @Sendable () async throws -> Void,
         retry: @Sendable (CodexOAuthCredentials) async throws -> ProviderFetchResult) async throws
         -> ProviderFetchResult
@@ -183,8 +225,14 @@ actor CodexManagedWorkspaceRefresh {
         var latest = failed
         var terminalReason: String?
         var unconfirmedRenewal = false
+        var expectedIdentity: Snapshot.Identity?
         do {
             latest = try Snapshot.read(env: env)
+            expectedIdentity = latest.identity ?? failed.identity
+            guard self.identityIsValid(latest.identity, expectedEmail: expectedEmail, fallback: nil) else {
+                terminalReason = "ownershipMismatch"
+                throw self.authenticationError("ownershipMismatch")
+            }
             state = try self.readState(at: stateURL)
             if state?.fingerprint != latest.fingerprint { state = nil }
             if state?.errorClass == "authentication" {
@@ -203,11 +251,24 @@ actor CodexManagedWorkspaceRefresh {
                     unconfirmedCount: unconfirmedCount)
                 // Persist before launching: a crash/restart must not create a refresh loop.
                 try self.writeState(state!, at: stateURL)
-                try await CodexCredentialRenewalGate.shared.run(renew)
+                try await CodexCredentialRenewalGate.shared.run {
+                    let queued = try Snapshot.read(env: env)
+                    guard self.identityIsValid(queued.identity, expectedEmail: expectedEmail, fallback: failed.identity) else {
+                        throw self.authenticationError("ownershipMismatch")
+                    }
+                    if queued.fingerprint == failed.fingerprint {
+                        try await renew()
+                    }
+                }
                 latest = try Snapshot.read(env: env)
                 unconfirmedRenewal = latest.fingerprint == failed.fingerprint
             }
-            guard latest.owner == workspace, !latest.credentials.isAPIKey else {
+            guard self.identityIsValid(latest.identity, expectedEmail: expectedEmail, fallback: failed.identity),
+                  !latest.credentials.isAPIKey else {
+                terminalReason = "ownershipMismatch"
+                throw self.authenticationError("ownershipMismatch")
+            }
+            guard latest.identity == expectedIdentity else {
                 terminalReason = "ownershipMismatch"
                 throw self.authenticationError("ownershipMismatch")
             }
@@ -253,6 +314,16 @@ actor CodexManagedWorkspaceRefresh {
             // Do not pass CLI error payloads or credential decode details into logs/UI.
             throw RecoveryError.temporarilyUnavailable
         }
+    }
+
+    private static func identityIsValid(
+        _ identity: Snapshot.Identity?,
+        expectedEmail: String?,
+        fallback: Snapshot.Identity?) -> Bool
+    {
+        guard let identity else { return false }
+        if let expectedEmail, identity.email != CodexIdentityResolver.normalizeEmail(expectedEmail) { return false }
+        return fallback == nil || identity == fallback
     }
 
     private static func authenticationError(_ reason: String) -> ProviderFetchClassifiedError {
