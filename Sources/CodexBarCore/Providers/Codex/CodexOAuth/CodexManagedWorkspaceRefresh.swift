@@ -135,30 +135,23 @@ actor CodexManagedWorkspaceRefresh {
     }
 
     private var flights: [String: Flight] = [:]
-    private var earlyRenewals: Set<UUID> = []
     private var flightWaiterTests: [
         (key: String, count: Int, continuation: CheckedContinuation<Void, Never>)
     ] = []
     private let stateDirectory: URL
 
-    private func markRenewalStarted(key: String, id: UUID) {
-        guard var flight = self.flights[key], flight.id == id else {
-            self.earlyRenewals.insert(id)
-            return
+    private func markRenewalStarted(key: String, id: UUID) throws {
+        try Task.checkCancellation()
+        guard var flight = self.flights[key], flight.id == id, !flight.waiters.isEmpty else {
+            throw CancellationError()
         }
         flight.renewalStarted = true
         self.flights[key] = flight
     }
 
-    private func removeFlightWaiter(key: String, id: UUID, waiterID: UUID) {
-        guard var flight = self.flights[key], flight.id == id else { return }
-        flight.waiters.remove(waiterID)
-        if flight.waiters.isEmpty, !flight.renewalStarted {
-            self.flights[key] = nil
-        } else {
-            self.flights[key] = flight
-        }
-        self.signalFlightWaiters(key: key)
+    private func finishFlight(key: String, id: UUID) {
+        guard self.flights[key]?.id == id else { return }
+        self.flights[key] = nil
     }
 
     private func signalFlightWaiters(key: String) {
@@ -175,10 +168,8 @@ actor CodexManagedWorkspaceRefresh {
         else { return }
         if flight.waiters.isEmpty, !flight.renewalStarted {
             flight.task.cancel()
-            self.flights[key] = nil
-        } else {
-            self.flights[key] = flight
         }
+        self.flights[key] = flight
     }
 
     private func awaitFlight(
@@ -187,10 +178,9 @@ actor CodexManagedWorkspaceRefresh {
         waiterID: UUID) async throws -> ProviderFetchResult
     {
         try await withTaskCancellationHandler {
-            defer { self.removeFlightWaiter(key: key, id: flight.id, waiterID: waiterID) }
-            let result = try await flight.task.value
+            let result = await flight.task.result
             try Task.checkCancellation()
-            return result
+            return try result.get()
         } onCancel: {
             Task { await self.cancelFlightWaiter(key: key, id: flight.id, waiterID: waiterID) }
         }
@@ -247,7 +237,8 @@ actor CodexManagedWorkspaceRefresh {
         let waiterID = UUID()
         try Task.checkCancellation()
         let task = Task {
-            try await Self.perform(
+            defer { self.finishFlight(key: key, id: id) }
+            return try await Self.perform(
                 home: URL(fileURLWithPath: key),
                 workspace: workspace,
                 failed: failed,
@@ -255,7 +246,7 @@ actor CodexManagedWorkspaceRefresh {
                 stateURL: stateURL,
                 now: now,
                 expectedEmail: expectedEmail,
-                renewalStarted: { await self.markRenewalStarted(key: key, id: id) },
+                renewalStarted: { try await self.markRenewalStarted(key: key, id: id) },
                 renew: renew,
                 retry: retry)
         }
@@ -264,8 +255,7 @@ actor CodexManagedWorkspaceRefresh {
             workspace: workspace,
             fingerprint: failed.fingerprint,
             task: task,
-            waiters: [waiterID],
-            renewalStarted: self.earlyRenewals.remove(id) != nil)
+            waiters: [waiterID])
         self.signalFlightWaiters(key: key)
         return try await self.awaitFlight(key: key, flight: self.flights[key]!, waiterID: waiterID)
     }
@@ -319,7 +309,7 @@ actor CodexManagedWorkspaceRefresh {
         stateURL: URL,
         now: Date,
         expectedEmail: String?,
-        renewalStarted: @escaping @Sendable () async -> Void,
+        renewalStarted: @escaping @Sendable () async throws -> Void,
         renew: @Sendable () async throws -> Void,
         retry: @Sendable (CodexOAuthCredentials) async throws -> ProviderFetchResult) async throws
         -> ProviderFetchResult
@@ -364,7 +354,7 @@ actor CodexManagedWorkspaceRefresh {
                         throw self.authenticationError("ownershipMismatch")
                     }
                     if queued.fingerprint == failed.fingerprint {
-                        await renewalStarted()
+                        try await renewalStarted()
                         try await renew()
                     }
                 }
