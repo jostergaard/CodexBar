@@ -304,8 +304,9 @@ actor CodexManagedWorkspaceRefresh {
             let ownershipFailure = terminalReason == "ownershipMismatch"
                 && (expectedEmail != nil || expectedIdentity != nil)
             if ownershipFailure { terminalReason = "ownershipMismatch" }
-            let authenticationFailure = ownershipFailure || (!changedDuringFailure && (terminalReason != nil
-                || (error as? ProviderFetchClassifiedError)?.kind == .authenticationExpired))
+            let authenticationFailure = ownershipFailure || (!changedDuringFailure && (
+                (terminalReason != nil && (terminalReason != "ownershipMismatch" || expectedEmail != nil || expectedIdentity != nil))
+                    || (error as? ProviderFetchClassifiedError)?.kind == .authenticationExpired))
             var failure = state ?? State(
                 fingerprint: latest.fingerprint,
                 attemptCount: 1,
