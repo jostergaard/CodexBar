@@ -2,7 +2,7 @@ import Foundation
 import Testing
 @testable import CodexBarCore
 
-@Suite(CodexCredentialFixtures())
+@Suite(.serialized, CodexCredentialFixtures())
 struct CodexManagedCredentialRenewalTests {
     @Test(arguments: [ProviderSourceMode.auto, .oauth], [true, false])
     func `managed OAuth renews expired credentials or an unexpired token rejected with 401`(
@@ -44,6 +44,213 @@ struct CodexManagedCredentialRenewalTests {
         #expect(await calls.renewals == 1)
         #expect(await transport.requests().count == (expired ? 1 : 2))
         #expect(try fixture.snapshot().credentials.accessToken == Fixture.token("rotated"))
+    }
+
+    @Test
+    func `alternate selected workspace recovers while preserving selected usage header`() async throws {
+        let fixture = try Fixture()
+        try fixture.rotate(
+            generation: "original", owner: "native-default", email: "fixture@example.test", expired: true)
+        let calls = Calls()
+        let transport = ProviderHTTPTransportStub { request in
+            #expect(request.value(forHTTPHeaderField: "ChatGPT-Account-Id") == "selected-workspace")
+            if request.value(forHTTPHeaderField: "Authorization") == "Bearer \(fixture.originalToken)" {
+                return try Self.response(request, code: 401)
+            }
+            return try Self.response(request)
+        }
+        let context = Self.context(mode: .oauth, fixture: fixture, workspace: "selected-workspace")
+        let result = try await CodexAuthenticatedHTTPTransport.$overrideForTesting.withValue(transport) {
+            try await CodexOAuthFetchStrategy.fetchManagedWorkspace(
+                context, home: fixture.home, workspace: "selected-workspace", recovery: fixture.coordinator(), renew: {
+                    await calls.renewed()
+                    try fixture.rotate(owner: "native-default", email: "fixture@example.test")
+                })
+        }
+        #expect(result.sourceLabel == "oauth")
+        #expect(await calls.renewals == 1)
+        #expect(await transport.requests().count == 2)
+    }
+
+    @Test
+    func `each selected account with a shared workspace renews its own email`() async throws {
+        let fixtures = try (0..<5).map { index in
+            try Fixture(email: "account\(index)@example.test")
+        }
+        for fixture in fixtures {
+            let failed = try fixture.snapshot()
+            let calls = Calls()
+            _ = try await fixture.coordinator().recover(
+                home: fixture.home,
+                workspace: Fixture.workspace,
+                failed: failed,
+                env: fixture.env,
+                expectedEmail: fixture.email,
+                renew: { await calls.renewed() },
+                retry: { credentials in
+                    await calls.retried()
+                    #expect(credentials.accessToken == fixture.originalToken)
+                    return Self.result()
+                })
+            #expect(await calls.renewals == 1)
+            #expect(await calls.retries == 1)
+        }
+    }
+
+    @Test(arguments: [false, true])
+    func `renewal rejects a changed email or subject before usage retry`(changedSubject: Bool) async throws {
+        let fixture = try Fixture()
+        let failed = try fixture.snapshot()
+        let calls = Calls()
+        await Self.expectUnauthorized {
+            try await fixture.coordinator().recover(
+                home: fixture.home,
+                workspace: Fixture.workspace,
+                failed: failed,
+                env: fixture.env,
+                expectedEmail: fixture.email,
+                renew: {
+                    await calls.renewed()
+                    try fixture.rotate(
+                        email: changedSubject ? fixture.email : "different@example.test",
+                        subject: changedSubject ? "different-subject" : fixture.subject)
+                },
+                retry: { _ in
+                    await calls.retried()
+                    return Self.result()
+                })
+        }
+        #expect(await calls.renewals == 1)
+        #expect(await calls.retries == 0)
+    }
+
+    @Test
+    func `email mismatch before launch rejects without renewal or retry`() async throws {
+        let fixture = try Fixture()
+        let calls = Calls()
+        await Self.expectUnauthorized {
+            try await fixture.coordinator().recover(
+                home: fixture.home,
+                workspace: Fixture.workspace,
+                failed: try fixture.snapshot(),
+                env: fixture.env,
+                expectedEmail: "not-the-selected-account@example.test",
+                renew: { await calls.renewed() },
+                retry: { _ in
+                    await calls.retried()
+                    return Self.result()
+                })
+        }
+        #expect(await calls.renewals == 0)
+        #expect(await calls.retries == 0)
+    }
+
+    @Test
+    func `already cancelled recovery does not renew retry or write state`() async throws {
+        let fixture = try Fixture()
+        let calls = Calls()
+        let task = Task {
+            try await fixture.coordinator().recover(
+                home: fixture.home,
+                workspace: Fixture.workspace,
+                failed: try fixture.snapshot(),
+                env: fixture.env,
+                renew: { await calls.renewed() },
+                retry: { _ in
+                    await calls.retried()
+                    return Self.result()
+                })
+        }
+        task.cancel()
+        await #expect(throws: CancellationError.self) { try await task.value }
+        #expect(await calls.renewals == 0)
+        #expect(await calls.retries == 0)
+        let stateFiles = (try? FileManager.default.contentsOfDirectory(at: fixture.state, includingPropertiesForKeys: nil)) ?? []
+        #expect(stateFiles.isEmpty)
+    }
+
+    @Test
+    func `queued renewal rechecks ownership after both gate slots are released`() async throws {
+        let blockers = try (0..<2).map { _ in try Fixture() }
+        let queued = try Fixture()
+        let blocker = RenewalBlocker()
+        let blockerTasks = try blockers.map { fixture in
+            Task {
+                try await fixture.coordinator().recover(
+                    home: fixture.home,
+                    workspace: Fixture.workspace,
+                    failed: try fixture.snapshot(),
+                    env: fixture.env,
+                    renew: { try await blocker.enterAndWait() },
+                    retry: { _ in Self.result() })
+            }
+        }
+        await blocker.waitForStarted(2)
+        let queuedCalls = Calls()
+        let queuedTask = Task {
+            try await queued.coordinator().recover(
+                home: queued.home,
+                workspace: Fixture.workspace,
+                failed: try queued.snapshot(),
+                env: queued.env,
+                renew: { await queuedCalls.renewed() },
+                retry: { _ in
+                    await queuedCalls.retried()
+                    return Self.result()
+                })
+        }
+        for _ in 0..<1000 {
+            let count = (try? FileManager.default.contentsOfDirectory(at: queued.state, includingPropertiesForKeys: nil).count) ?? 0
+            if count >= 3 { break }
+            await Task.yield()
+        }
+        try queued.rotate(owner: "different-owner")
+        await blocker.release()
+        for task in blockerTasks {
+            _ = try await task.value
+        }
+        await Self.expectUnauthorized { try await queuedTask.value }
+        #expect(await queuedCalls.renewals == 0)
+        #expect(await queuedCalls.retries == 0)
+    }
+
+    @Test
+    func `ownership mismatch state clears when the correct login is restored`() async throws {
+        let fixture = try Fixture()
+        let failed = try fixture.snapshot()
+        let calls = Calls()
+        await Self.expectUnauthorized {
+            try await fixture.coordinator().recover(
+                home: fixture.home,
+                workspace: Fixture.workspace,
+                failed: failed,
+                env: fixture.env,
+                renew: {
+                    await calls.renewed()
+                    try fixture.rotate(owner: "different-owner")
+                },
+                retry: { _ in
+                    await calls.retried()
+                    return Self.result()
+                })
+        }
+        #expect(await calls.renewals == 1)
+        #expect(await calls.retries == 0)
+
+        try fixture.rotate(generation: "new-login")
+        let restored = try fixture.snapshot()
+        _ = try await fixture.coordinator().recover(
+            home: fixture.home,
+            workspace: Fixture.workspace,
+            failed: restored,
+            env: fixture.env,
+            renew: { await calls.renewed() },
+            retry: { _ in
+                await calls.retried()
+                return Self.result()
+            })
+        #expect(await calls.renewals == 2)
+        #expect(await calls.retries == 1)
     }
 
     @Test
@@ -475,6 +682,38 @@ struct CodexManagedCredentialRenewalTests {
         #expect(await transport.requests().count == fixtures.count * 2)
     }
 
+    private actor RenewalBlocker {
+        private var started = 0
+        private var startedWaiters: [CheckedContinuation<Void, Never>] = []
+        private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+        func enterAndWait() async throws {
+            self.started += 1
+            self.startedWaiters.forEach { $0.resume() }
+            self.startedWaiters.removeAll()
+            try await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    self.releaseWaiters.append(continuation)
+                }
+            } onCancel: {
+                Task { await self.release() }
+            }
+        }
+
+        func waitForStarted(_ expected: Int) async {
+            if self.started >= expected { return }
+            await withCheckedContinuation { continuation in
+                self.startedWaiters.append(continuation)
+            }
+            await self.waitForStarted(expected)
+        }
+
+        func release() {
+            self.releaseWaiters.forEach { $0.resume() }
+            self.releaseWaiters.removeAll()
+        }
+    }
+
     private actor Calls {
         var renewals = 0
         var retries = 0
@@ -498,18 +737,22 @@ struct CodexManagedCredentialRenewalTests {
         let home: URL
         let state: URL
         let originalToken: String
+        let email: String
+        let subject: String
 
         var env: [String: String] {
             ["CODEX_HOME": self.home.path, "HOME": self.home.deletingLastPathComponent().path, "PATH": ""]
         }
 
-        init(expired: Bool = true) throws {
+        init(expired: Bool = true, email: String = "fixture@example.test", subject: String = "fixture-subject") throws {
             let root = CodexCredentialFixtures.root.appendingPathComponent(UUID().uuidString)
             self.home = root.appendingPathComponent("home")
             self.state = root.appendingPathComponent("state")
             self.originalToken = Self.token("original", expired: expired)
+            self.email = email
+            self.subject = subject
             try FileManager.default.createDirectory(at: self.home, withIntermediateDirectories: true)
-            try self.rotate(generation: "original", expired: expired)
+            try self.rotate(generation: "original", email: email, subject: subject, expired: expired)
         }
 
         func coordinator() -> CodexManagedWorkspaceRefresh {
@@ -523,13 +766,15 @@ struct CodexManagedCredentialRenewalTests {
         func rotate(
             generation: String = "rotated",
             owner: String = Self.workspace,
+            email: String = "fixture@example.test",
+            subject: String = "fixture-subject",
             expired: Bool = false) throws
         {
             let data = try JSONSerialization.data(withJSONObject: [
                 "tokens": [
                     "access_token": Self.token(generation, expired: expired),
                     "refresh_token": "fixture-refresh-\(generation)",
-                    "id_token": Self.idToken(email: "fixture@example.test", subject: "fixture-subject"),
+                    "id_token": Self.idToken(email: email, subject: subject),
                     "account_id": owner,
                 ],
                 "last_refresh": "2000-01-01T00:00:00Z",

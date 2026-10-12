@@ -299,9 +299,13 @@ actor CodexManagedWorkspaceRefresh {
             if case let .authentication(reason) = error as? CodexCredentialRefreshError {
                 terminalReason = reason.rawValue
             }
-            // A CLI publication or new login that overlapped the failure has not itself been rejected.
-            let authenticationFailure = !changedDuringFailure && (terminalReason != nil
-                || (error as? ProviderFetchClassifiedError)?.kind == .authenticationExpired)
+            // Ownership mismatches are terminal even when auth.json changed while the gate was held.
+            // Other authentication failures may be superseded by a new same-owner publication.
+            let ownershipFailure = terminalReason == "ownershipMismatch"
+                || (error as? ProviderFetchClassifiedError)?.message.contains("ownershipMismatch") == true
+            if ownershipFailure { terminalReason = "ownershipMismatch" }
+            let authenticationFailure = ownershipFailure || (!changedDuringFailure && (terminalReason != nil
+                || (error as? ProviderFetchClassifiedError)?.kind == .authenticationExpired))
             var failure = state ?? State(
                 fingerprint: latest.fingerprint,
                 attemptCount: 1,
