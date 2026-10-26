@@ -103,6 +103,7 @@ extension ProviderInstanceID {
     public static let aerostack = UsageProvider.aerostack.instanceID
     public static let sailresearch = UsageProvider.sailresearch.instanceID
     public static let sofya = UsageProvider.sofya.instanceID
+    public static let nanogpt = UsageProvider.nanogpt.instanceID
 }
 
 // swiftformat:enable sortDeclarations

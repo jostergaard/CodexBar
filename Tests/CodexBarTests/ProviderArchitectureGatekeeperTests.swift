@@ -157,8 +157,8 @@ struct ProviderArchitectureGatekeeperTests {
         }
 
         // Both provider batches extend the palette without changing existing provider colors.
-        #expect(widgetFingerprint == 14_588_483_983_924_548_755)
-        #expect(burnDownFingerprint == 14_027_062_183_472_836_508)
+        #expect(widgetFingerprint == 6_378_358_628_436_779_284)
+        #expect(burnDownFingerprint == 9_782_899_570_468_897_999)
     }
 
     @Test
