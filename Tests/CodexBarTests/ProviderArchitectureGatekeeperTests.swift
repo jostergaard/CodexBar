@@ -156,9 +156,9 @@ struct ProviderArchitectureGatekeeperTests {
             Self.hash(descriptor.branding.burnDownWidgetColor, into: &burnDownFingerprint)
         }
 
-        // Tripo extends the audited palette without changing existing provider colors.
-        #expect(widgetFingerprint == 8_165_290_587_712_788_196)
-        #expect(burnDownFingerprint == 4_518_705_644_902_934_406)
+        // NanoGPT extends the audited palette without changing existing provider colors.
+        #expect(widgetFingerprint == 15_621_281_805_792_842_166)
+        #expect(burnDownFingerprint == 5_980_864_241_800_408_324)
     }
 
     @Test
