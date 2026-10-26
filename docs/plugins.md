@@ -135,6 +135,10 @@ use the shared API credential spec and fixed-origin GET requests on both engines
 through the spec's workspace field. Their scripts preserve each API's account scope, separate credit pools, and
 reported periods; missing quotas and reset dates remain unavailable.
 
+[NanoGPT](nanogpt.md) uses the shared API credential spec with an `x-api-key` header: a fixed-origin POST reads the
+prepaid USD balance, and a best-effort GET adds daily and weekly input-token windows only for an active subscription.
+A failed subscription request never fails the balance fetch.
+
 ```js
 defineProvider({
   id: "acme-usage",
