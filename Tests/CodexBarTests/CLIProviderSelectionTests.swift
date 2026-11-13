@@ -51,6 +51,7 @@ struct CLIProviderSelectionTests {
             "|abliteration|",
             "|tripo|",
             "|nanogpt|",
+            "|crowbot|",
             "|both|",
             "|all]",
         ]

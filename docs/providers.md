@@ -8,7 +8,7 @@ read_when:
 
 # Providers
 
-CodexBar currently registers 114 provider IDs. Some companies expose multiple surfaces, such as Codex vs OpenAI API or
+CodexBar currently registers 115 provider IDs. Some companies expose multiple surfaces, such as Codex vs OpenAI API or
 OpenCode vs OpenCode Go, because the auth source and quota shape differ.
 
 ## Fetch strategies (current)
@@ -194,6 +194,7 @@ complete when the available scan window covers fewer days.
 | [SiliconFlow](siliconflow.md) | API key for the prepaid account balance on the China (CNY) or international (USD) API. |
 | [Tripo](tripo.md) | API key for available and reserved account credits from the official account balance endpoint. |
 | [NanoGPT](nanogpt.md) | API key for the prepaid USD balance, with daily and weekly input-token windows for active subscriptions. |
+| [crowbot](crowbot.md) | API key for prepaid USD balance and optional pass allowance through the free account endpoint. |
 
 <!-- End generated provider additions -->
 

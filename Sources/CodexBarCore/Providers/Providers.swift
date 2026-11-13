@@ -133,6 +133,7 @@ public enum UsageProvider: String, CaseIterable, Sendable, Codable {
     case siliconflow
     case tripo
     case nanogpt
+    case crowbot
 }
 
 // swiftformat:enable sortDeclarations

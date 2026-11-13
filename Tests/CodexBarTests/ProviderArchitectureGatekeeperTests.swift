@@ -156,9 +156,9 @@ struct ProviderArchitectureGatekeeperTests {
             Self.hash(descriptor.branding.burnDownWidgetColor, into: &burnDownFingerprint)
         }
 
-        // NanoGPT extends the audited palette without changing existing provider colors.
-        #expect(widgetFingerprint == 15_621_281_805_792_842_166)
-        #expect(burnDownFingerprint == 5_980_864_241_800_408_324)
+        // NanoGPT and crowbot extend the audited palette without changing existing provider colors.
+        #expect(widgetFingerprint == 17_721_128_057_187_827_995)
+        #expect(burnDownFingerprint == 5_727_679_879_728_772_379)
     }
 
     @Test
