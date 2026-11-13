@@ -12,6 +12,52 @@ import Glibc
 import Musl
 #endif
 
+enum CodexCredentialRefreshAuthReason: String, Sendable, CaseIterable {
+    case invalidGrant = "invalid_grant"
+    case refreshTokenInvalidated = "refresh_token_invalidated"
+    case refreshTokenExpired = "refresh_token_expired"
+    case refreshTokenReused = "refresh_token_reused"
+    case refreshTokenRevoked = "refresh_token_revoked"
+    case loginRequired = "login_required"
+
+    static func fromRPCError(_ error: [String: Any]) -> Self? {
+        if let data = error["data"] as? [String: Any], let code = data["code"] as? String,
+           let reason = Self(rawValue: code)
+        {
+            return reason
+        }
+        if let code = error["code"] as? String, let reason = Self(rawValue: code) {
+            return reason
+        }
+        guard let message = error["message"] as? String else { return nil }
+        let identifiers = message.components(separatedBy: CharacterSet.alphanumerics
+            .union(CharacterSet(charactersIn: "_")).inverted)
+        return identifiers.lazy.compactMap(Self.init(rawValue:)).first
+    }
+}
+
+enum CodexCredentialRefreshError: Error, LocalizedError {
+    case unavailable
+    case startFailed
+    case timeout
+    case transport
+    case authentication(CodexCredentialRefreshAuthReason)
+    case requestRejected
+    case invalidResponse
+
+    var errorDescription: String? {
+        switch self {
+        case .unavailable: "Codex credential refresh unavailable: CLI not installed."
+        case .startFailed: "Codex credential refresh could not start."
+        case .timeout: "Codex credential refresh timed out."
+        case .transport: "Codex credential refresh connection closed."
+        case let .authentication(reason): "Codex credential refresh requires login (\(reason.rawValue))."
+        case .requestRejected: "Codex credential refresh request was rejected."
+        case .invalidResponse: "Codex credential refresh returned invalid data."
+        }
+    }
+}
+
 /// Seat changes can invalidate every workspace account together. Bound CLI launches across homes.
 private actor CodexCredentialRenewalGate {
     static let shared = CodexCredentialRenewalGate()
