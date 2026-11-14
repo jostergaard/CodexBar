@@ -116,6 +116,50 @@ struct CodexProviderSettingsBuilderTests {
     }
 
     @Test
+    func `builder expected managed email follows selected account and is nil for other sources`() {
+        let managed = ManagedCodexAccount(
+            id: UUID(),
+            email: "selected@example.com",
+            managedHomePath: "/tmp/selected",
+            createdAt: 1,
+            updatedAt: 2,
+            lastAuthenticatedAt: 3)
+        let base = CodexAccountReconciliationSnapshot(
+            storedAccounts: [managed],
+            activeStoredAccount: managed,
+            liveSystemAccount: nil,
+            matchingStoredAccountForLiveSystemAccount: nil,
+            activeSource: .managedAccount(id: managed.id),
+            hasUnreadableAddedAccountStore: false)
+        let managedSettings = CodexProviderSettingsBuilder.make(input: CodexProviderSettingsBuilderInput(
+            usageDataSource: .oauth,
+            cookieSource: .off,
+            manualCookieHeader: nil,
+            reconciliationSnapshot: base,
+            resolvedActiveSource: CodexResolvedActiveSource(
+                persistedSource: .managedAccount(id: managed.id), resolvedSource: .managedAccount(id: managed.id))))
+        #expect(managedSettings.managedAccountExpectedEmail == "selected@example.com")
+
+        let liveSettings = CodexProviderSettingsBuilder.make(input: CodexProviderSettingsBuilderInput(
+            usageDataSource: .oauth,
+            cookieSource: .off,
+            manualCookieHeader: nil,
+            reconciliationSnapshot: base,
+            resolvedActiveSource: CodexResolvedActiveSource(persistedSource: .liveSystem, resolvedSource: .liveSystem)))
+        #expect(liveSettings.managedAccountExpectedEmail == nil)
+
+        let profileSettings = CodexProviderSettingsBuilder.make(input: CodexProviderSettingsBuilderInput(
+            usageDataSource: .oauth,
+            cookieSource: .off,
+            manualCookieHeader: nil,
+            reconciliationSnapshot: base,
+            resolvedActiveSource: CodexResolvedActiveSource(
+                persistedSource: .profileHome(path: "/tmp/profile"),
+                resolvedSource: .profileHome(path: "/tmp/profile"))))
+        #expect(profileSettings.managedAccountExpectedEmail == nil)
+    }
+
+    @Test
     func `known owner catalog includes runtime managed and live identities`() {
         let storedAccount = ManagedCodexAccount(
             id: UUID(),

@@ -97,6 +97,14 @@ public enum CodexProviderSettingsBuilder {
         case .managedAccount:
             input.reconciliationSnapshot.activeStoredAccount?.effectiveWorkspaceAccountID
         }
+        let managedAccountExpectedEmail: String? = switch input.resolvedActiveSource.resolvedSource {
+        case .liveSystem, .profileHome:
+            nil
+        case let .managedAccount(id):
+            input.reconciliationSnapshot.storedAccounts.first(where: { $0.id == id }).map {
+                input.reconciliationSnapshot.runtimeEmail(for: $0)
+            }
+        }
 
         return ProviderSettingsSnapshot.CodexProviderSettings(
             usageDataSource: input.usageDataSource,
@@ -110,6 +118,7 @@ public enum CodexProviderSettingsBuilder {
             openAIWebCacheScope: openAIWebCacheScope,
             dashboardAuthorityKnownOwners: CodexKnownOwnerCatalog.candidates(from: snapshot),
             allowExternalOAuthSources: input.allowExternalOAuthSources,
-            managedWorkspaceAccountID: managedWorkspaceAccountID)
+            managedWorkspaceAccountID: managedWorkspaceAccountID,
+            managedAccountExpectedEmail: managedAccountExpectedEmail)
     }
 }

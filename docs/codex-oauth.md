@@ -321,6 +321,16 @@ implementation instead of copying an OAuth-only fetch example:
 HTTP 401 remains an authentication failure. HTTP 403 retains its status as a terminal API permission failure for
 OAuth and PAT requests, including reset-credit and spend-control endpoints; it does not trigger automatic CLI recovery.
 
+Managed workspace accounts with an explicit `CODEX_HOME` have a separate credential-only recovery path. A stale
+native credential or usage HTTP 401 (for example after a workspace seat change) runs Codex app-server `account/read`
+with `{"refreshToken":true}` in that home, then retries scoped OAuth once; CLI usage is never substituted. Recovery
+coalesces per home under `<home>/.codexbar-refresh.lock`, runs at most two CLI renewals at once, and skips renewal
+when `auth.json` already changed. The CLI owns all credential writes. The renewed credential must keep the selected
+account's email, subject, and `account_id`. Backoff state (fingerprints and sanitized error classes, no tokens) lives in
+`Application Support/CodexBar/CodexCredentialRefresh`, starting at 30 seconds and capped at one hour. Known
+revoked/invalid refresh errors, ownership mismatches, a 401 after changed credentials, or three unchanged-plus-401
+renewals require login; other failures stay transient.
+
 The key invariant is that the credential snapshot used for the usage request is also passed to
 reset-credit enrichment; reloading `auth.json` after a refresh would reintroduce the shared-file
 race this design is intended to avoid.

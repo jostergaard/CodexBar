@@ -1009,6 +1009,7 @@ private final class CodexRPCClient: @unchecked Sendable {
     private var nextID = 1
     private let initializeTimeoutSeconds: TimeInterval
     private let requestTimeoutSeconds: TimeInterval
+    private let suppressSensitiveDiagnostics: Bool
 
     init(
         executable: String = "codex", // Provider-specific by design: this RPC client launches Codex app-server.
@@ -1016,10 +1017,12 @@ private final class CodexRPCClient: @unchecked Sendable {
         environment: [String: String] = ProcessInfo.processInfo.environment,
         initializeTimeoutSeconds: TimeInterval = 8.0,
         requestTimeoutSeconds: TimeInterval = 3.0,
+        suppressSensitiveDiagnostics: Bool = false,
         resolveExecutable: CodexExecutableResolver = defaultCodexExecutableResolver) throws
     {
         self.initializeTimeoutSeconds = initializeTimeoutSeconds
         self.requestTimeoutSeconds = requestTimeoutSeconds
+        self.suppressSensitiveDiagnostics = suppressSensitiveDiagnostics
         let resolution = resolveExecutable(environment, executable)
 
         guard let resolution else {
@@ -1052,14 +1055,18 @@ private final class CodexRPCClient: @unchecked Sendable {
         } catch {
             let message = error.localizedDescription
             let throttled = CodexCLILaunchGate.shared.recordLaunchFailure(binary: resolvedExec, message: message)
-            Self.log.warning("Codex RPC failed to start", metadata: ["error": message])
+            Self.log.warning(
+                "Codex RPC failed to start",
+                metadata: suppressSensitiveDiagnostics ? nil : ["error": message])
             throw RPCWireError.startFailed(throttled ?? message)
         }
 
         self.output.start(process: self.process, stdin: self.stdin) {
             Self.log.warning("Codex RPC line exceeded memory limit; terminating process")
         } onStderr: { line in
-            Self.log.debug("[codex stderr] \(line)")
+            if !suppressSensitiveDiagnostics {
+                Self.log.debug("[codex stderr] \(line)")
+            }
         }
     }
 
@@ -1071,8 +1078,10 @@ private final class CodexRPCClient: @unchecked Sendable {
         try self.sendPayload(["method": "initialized", "params": [:]])
     }
 
-    func fetchAccount() async throws -> RPCAccountResponse {
-        let message = try await self.request(method: "account/read")
+    func fetchAccount(refreshToken: Bool = false) async throws -> RPCAccountResponse {
+        let message = try await self.request(
+            method: "account/read",
+            params: refreshToken ? ["refreshToken": true] : nil)
         return try self.decodeResult(from: message)
     }
 
@@ -1111,14 +1120,24 @@ private final class CodexRPCClient: @unchecked Sendable {
                     let message = try await self.readNextMessage()
 
                     if message["id"] == nil, let methodName = message["method"] as? String {
-                        Self.log.debug("[codex notify] \(methodName)")
+                        if !self.suppressSensitiveDiagnostics {
+                            Self.log.debug("[codex notify] \(methodName)")
+                        }
                         continue
                     }
 
                     guard let messageID = self.jsonID(message["id"]), messageID == id else { continue }
 
-                    if let error = message["error"] as? [String: Any], let messageText = error["message"] as? String {
-                        throw RPCWireError.requestFailed(messageText)
+                    if let error = message["error"] as? [String: Any] {
+                        if self.suppressSensitiveDiagnostics {
+                            if let reason = CodexCredentialRefreshAuthReason.fromRPCError(error) {
+                                throw CodexCredentialRefreshError.authentication(reason)
+                            }
+                            throw CodexCredentialRefreshError.requestRejected
+                        }
+                        if let messageText = error["message"] as? String {
+                            throw RPCWireError.requestFailed(messageText)
+                        }
                     }
 
                     return SendableJSONMessage(value: message)
@@ -1146,6 +1165,9 @@ private final class CodexRPCClient: @unchecked Sendable {
         do {
             try self.stdin.write(data)
         } catch {
+            if self.suppressSensitiveDiagnostics {
+                throw CodexCredentialRefreshError.transport
+            }
             throw RPCWireError.requestFailed("codex app-server stdin closed: \(error.localizedDescription)")
         }
     }
@@ -1158,6 +1180,9 @@ private final class CodexRPCClient: @unchecked Sendable {
             if let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] {
                 return json
             }
+        }
+        if self.suppressSensitiveDiagnostics {
+            throw CodexCredentialRefreshError.transport
         }
         throw RPCWireError.malformed("codex app-server closed stdout")
     }
@@ -1216,6 +1241,36 @@ public struct UsageFetcher: Sendable {
             throw UsageError.noRateLimitsFound
         }
         return usage
+    }
+
+    /// Lets the CLI renew its credentials without making a usage request. Callers must re-read auth.json
+    /// to determine whether the credentials changed; a completed RPC alone does not prove rotation.
+    func refreshCodexCredentials() async throws {
+        do {
+            try Task.checkCancellation()
+            let rpc = try CodexRPCClient(
+                arguments: self.codexArguments,
+                environment: self.environment,
+                initializeTimeoutSeconds: self.initializeTimeoutSeconds,
+                requestTimeoutSeconds: self.requestTimeoutSeconds,
+                suppressSensitiveDiagnostics: true,
+                resolveExecutable: self.codexExecutableResolver)
+            defer { rpc.shutdown() }
+            try await rpc.initialize(clientName: "codexbar", clientVersion: "0.5.4")
+            _ = try await rpc.fetchAccount(refreshToken: true)
+            try Task.checkCancellation()
+        } catch {
+            if error is CancellationError || Task.isCancelled { throw CancellationError() }
+            if let error = error as? CodexCredentialRefreshError { throw error }
+            if case CodexStatusProbeError.codexNotInstalled = error { throw CodexCredentialRefreshError.unavailable }
+            // Never propagate CLI-supplied error text from a credential renewal.
+            switch error as? RPCWireError {
+            case .startFailed: throw CodexCredentialRefreshError.startFailed
+            case .timeout: throw CodexCredentialRefreshError.timeout
+            case .requestFailed: throw CodexCredentialRefreshError.requestRejected
+            case .malformed, nil: throw CodexCredentialRefreshError.invalidResponse
+            }
+        }
     }
 
     public func loadLatestCLIAccountSnapshot() async throws -> CodexCLIAccountSnapshot {
