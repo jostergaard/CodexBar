@@ -726,5 +726,33 @@
     "strategies": ["tripo.js"],
     "supportsTokenCost": false,
     "workspaceOrder": null
+  },
+  {
+    "availability": [true, true, true],
+    "cliResolution": {"NANO-GPT": ["nanogpt"], "NANOGPT": ["nanogpt"]},
+    "enterpriseHost": false,
+    "environmentAvailability": [[true, false], [true, true], [true, true], [true, true]],
+    "fields": ["secure"],
+    "id": "nanogpt",
+    "projectToken": "",
+    "projections": {"NANOGPT_API_KEY": "fixture-key"},
+    "sourceModes": ["api", "auto"],
+    "strategies": ["nanogpt.js"],
+    "supportsTokenCost": false,
+    "workspaceOrder": null
+  },
+  {
+    "availability": [true, true, true],
+    "cliResolution": {"CROWBOT": ["crowbot"]},
+    "enterpriseHost": false,
+    "environmentAvailability": [[true, false], [true, true], [true, true], [true, true]],
+    "fields": ["secure"],
+    "id": "crowbot",
+    "projectToken": "",
+    "projections": {"CROWBOT_API_KEY": "fixture-key"},
+    "sourceModes": ["api", "auto"],
+    "strategies": ["crowbot.js"],
+    "supportsTokenCost": false,
+    "workspaceOrder": null
   }
 ]
