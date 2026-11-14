@@ -4,6 +4,8 @@
 
 ### Added
 
+- NanoGPT: show the prepaid USD balance, plus daily and weekly input-token windows for active subscriptions.
+- crowbot: show the prepaid USD balance and optional pass allowance through the free account API.
 - CLI: declare DeepInfra setup guidance with API-key alternatives, piped input, and saved-account priority.
 - CLI: declare ElevenLabs setup guidance, including API-key alternatives, subscription-read permission, and saved-account priority (#5020). Thanks @vincent-peng!
 - Usage & Spend: add a Models view grouped by currency, preserve partial-history warnings, and match shared cards to the current appearance (#4889, #4888). Thanks @Chipagosfinest!

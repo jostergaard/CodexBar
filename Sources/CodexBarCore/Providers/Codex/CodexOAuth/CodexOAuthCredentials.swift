@@ -229,7 +229,7 @@ public enum CodexOAuthCredentialsStore {
         return CodexPATCredentials(token: token, source: source)
     }
 
-    private static func readAuthData(
+    static func readAuthData(
         env: [String: String],
         fileManager: FileManager = .default,
         homeDirectory: URL? = nil) throws -> Data

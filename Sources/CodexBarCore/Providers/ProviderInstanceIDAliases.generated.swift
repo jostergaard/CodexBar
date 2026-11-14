@@ -116,6 +116,8 @@ extension ProviderInstanceID {
     public static let opendesign = UsageProvider.opendesign.instanceID
     public static let siliconflow = UsageProvider.siliconflow.instanceID
     public static let tripo = UsageProvider.tripo.instanceID
+    public static let nanogpt = UsageProvider.nanogpt.instanceID
+    public static let crowbot = UsageProvider.crowbot.instanceID
 }
 
 // swiftformat:enable sortDeclarations
